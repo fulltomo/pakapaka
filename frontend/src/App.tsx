@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { Navbar, NavTab } from './components/Navbar';
+import { Races } from './pages/Races';
 import { WalletSession, ActiveModelStatus } from './types';
 import { api } from './services/api';
 import {
@@ -278,22 +279,7 @@ export const App: React.FC = () => {
           </div>
         )}
 
-        {activeTab === 'races' && (
-          <div className="bg-slate-900 border border-slate-800 rounded-xl p-6">
-            <div className="flex items-center justify-between pb-4 border-b border-slate-800">
-              <div className="flex items-center space-x-3">
-                <Trophy className="w-6 h-6 text-emerald-400" />
-                <h2 className="text-xl font-bold text-slate-100">レース一覧 ＆ AI予想ビュー</h2>
-              </div>
-              <span className="text-xs px-3 py-1 rounded-full bg-slate-800 text-slate-300 border border-slate-700">
-                Task 8 Preview
-              </span>
-            </div>
-            <p className="mt-4 text-sm text-slate-400">
-              このタブでは、確定済みおよび発走予定のレース一覧の確認、オッズ・出馬表、LightGBMモデルによる予想マーク（◎, ◯, ▲, ☆）や期待値（EV）の詳細表示を提供します。
-            </p>
-          </div>
-        )}
+        {activeTab === 'races' && <Races />}
 
         {activeTab === 'simulation' && (
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-6">
