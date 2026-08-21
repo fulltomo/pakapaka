@@ -36,6 +36,8 @@ jobs:
   scrape-and-train:
     runs-on: ubuntu-latest
     timeout-minutes: 360 # 最大6時間連続稼働
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout repository
