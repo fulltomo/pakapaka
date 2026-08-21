@@ -86,8 +86,11 @@ PYTHONPATH=backend python backend/seed_data.py
 
 #### バックエンド API サーバー (FastAPI)
 ```bash
-# 仮想環境が有効な状態で実行
-PYTHONPATH=backend uvicorn main:app --reload --port 8000
+# プロジェクトルートから起動する場合
+uvicorn backend.main:app --reload --port 8000
+
+# または backend ディレクトリから起動する場合
+cd backend && uvicorn main:app --reload --port 8000
 ```
 - APIドキュメント (Swagger UI): [http://localhost:8000/docs](http://localhost:8000/docs)
 - ヘルスチェック: [http://localhost:8000/health](http://localhost:8000/health)

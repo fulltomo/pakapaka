@@ -1,9 +1,12 @@
-"""
-Main FastAPI Application Entrypoint.
-"""
-
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+# Ensure backend root is in sys.path for direct imports
+BACKEND_DIR = Path(__file__).resolve().parent
+if str(BACKEND_DIR) not in sys.path:
+    sys.path.insert(0, str(BACKEND_DIR))
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
