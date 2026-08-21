@@ -236,7 +236,8 @@ export const Dashboard: React.FC<DashboardProps> = ({ onNavigate }) => {
   const winRate = wallet?.win_rate ?? (wallet?.total_bets && wallet.total_bets > 0 ? ((wallet.won_bets ?? 0) / wallet.total_bets) * 100 : 0);
   const wonBets = wallet?.won_bets ?? 0;
   const totalBets = wallet?.total_bets ?? 0;
-  const maxDrawdown = (wallet?.max_drawdown ?? 0) * 100;
+  const rawDd = wallet?.max_drawdown ?? 0;
+  const maxDrawdown = rawDd > 1 ? rawDd : rawDd * 100;
 
   return (
     <div className="space-y-6">
