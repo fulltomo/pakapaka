@@ -39,6 +39,8 @@ ENV/
 *.db
 .cache/
 data/cache/
+cache/
+backend/cache/
 
 # Models
 *.pkl

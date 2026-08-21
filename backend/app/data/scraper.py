@@ -54,7 +54,8 @@ class NetkeibaScraper:
                 self._last_request_time = time.time()
                 if response.status_code != 200:
                     return None
-                content = response.text
+                # netkeiba uses euc-jp encoding
+                content = response.content.decode("euc-jp", errors="replace")
                 if use_cache:
                     self.cache.set(race_id, content)
                 return content
@@ -66,14 +67,18 @@ class NetkeibaScraper:
         Extracts race name, course, distance, surface, weather, track condition from HTML soup.
         """
         race_name = "レース"
-        rname_elem = soup.find(class_="RaceName") or soup.find("h1") or soup.find(class_="racedata")
-        if rname_elem:
-            race_name = rname_elem.get_text(strip=True)
+        intro = soup.find(class_="data_intro")
+        if intro and intro.find("h1"):
+            race_name = intro.find("h1").get_text(strip=True)
+        else:
+            rname_elem = soup.find(class_="RaceName") or soup.find("h1") or soup.find(class_="racedata")
+            if rname_elem:
+                race_name = rname_elem.get_text(strip=True)
 
         # Race Course & Number
         race_course = "東京"
         race_number = 11
-        rdata02 = soup.find(class_="RaceData02")
+        rdata02 = soup.find(class_="RaceData02") or (intro.find(class_="smalltxt") if intro else None)
         if rdata02:
             rdata02_text = rdata02.get_text()
             course_match = re.search(r"(東京|中山|京都|阪神|新潟|中京|小倉|札幌|函館|福島)", rdata02_text)
@@ -135,82 +140,121 @@ class NetkeibaScraper:
 
     def _parse_entries(self, soup: BeautifulSoup, race_id: str) -> List[Dict[str, Any]]:
         """
-        Parses race result table into list of entry dictionaries.
+        Parses race result table into list of entry dictionaries using header-aware mapping.
         """
         entries = []
         table = soup.find("table", class_=re.compile(r"race_table|nk_tb_common"))
         if not table:
             return entries
 
+        # Extract header column map
+        header_tr = table.find("tr")
+        col_map: Dict[str, int] = {}
+        if header_tr:
+            for idx, th in enumerate(header_tr.find_all(["th", "td"])):
+                txt = th.get_text(strip=True)
+                if "着順" in txt or "着" == txt:
+                    col_map["finish_position"] = idx
+                elif "枠" in txt:
+                    col_map["post_position"] = idx
+                elif "馬番" in txt:
+                    col_map["horse_number"] = idx
+                elif "馬名" in txt:
+                    col_map["horse_name"] = idx
+                elif "性齢" in txt:
+                    col_map["sex_age"] = idx
+                elif "斤量" in txt:
+                    col_map["handicap_weight"] = idx
+                elif "騎手" in txt:
+                    col_map["jockey_name"] = idx
+                elif "タイム" in txt:
+                    col_map["finish_time"] = idx
+                elif "着差" in txt:
+                    col_map["margin"] = idx
+                elif "単勝" in txt or "オッズ" in txt:
+                    col_map["odds"] = idx
+                elif "人気" in txt:
+                    col_map["popularity"] = idx
+                elif "馬体重" in txt:
+                    col_map["horse_weight"] = idx
+                elif "調教師" in txt or "厩舎" in txt:
+                    col_map["trainer_name"] = idx
+
         rows = table.find_all("tr")[1:]  # Skip header
         for row in rows:
             cols = row.find_all(["td", "th"])
-            if len(cols) < 8:
+            if len(cols) < 5:
                 continue
 
             try:
-                # 0: 着順, 1: 枠番, 2: 馬番, 3: 馬名, 4: 性齢, 5: 斤量, 6: 騎手, 7: タイム
-                finish_pos_text = cols[0].get_text(strip=True)
+                def get_val(key: str, default: str = "") -> str:
+                    idx = col_map.get(key)
+                    if idx is not None and idx < len(cols):
+                        return cols[idx].get_text(strip=True)
+                    return default
+
+                # Finish Position
+                finish_pos_text = get_val("finish_position")
                 finish_position = int(finish_pos_text) if finish_pos_text.isdigit() else None
 
-                post_position_text = cols[1].get_text(strip=True)
-                post_position = int(post_position_text) if post_position_text.isdigit() else 1
+                # Post position & Horse number
+                post_pos_text = get_val("post_position", "1")
+                post_position = int(post_pos_text) if post_pos_text.isdigit() else 1
 
-                horse_num_text = cols[2].get_text(strip=True)
+                horse_num_text = get_val("horse_number", str(len(entries) + 1))
                 horse_number = int(horse_num_text) if horse_num_text.isdigit() else len(entries) + 1
 
-                horse_link = cols[3].find("a")
-                horse_name = cols[3].get_text(strip=True)
+                # Horse Name & ID
+                horse_idx = col_map.get("horse_name", 3)
+                horse_name = "競走馬"
                 horse_id = f"h_{horse_number}"
-                if horse_link and horse_link.get("href"):
-                    h_match = re.search(r"/horse/(\d+)/?", horse_link["href"])
-                    if h_match:
-                        horse_id = h_match.group(1)
+                if horse_idx < len(cols):
+                    horse_name = cols[horse_idx].get_text(strip=True)
+                    h_link = cols[horse_idx].find("a")
+                    if h_link and h_link.get("href"):
+                        h_match = re.search(r"/horse/(\d+)/?", h_link["href"])
+                        if h_match:
+                            horse_id = h_match.group(1)
 
-                sex_age_text = cols[4].get_text(strip=True)
+                # Sex & Age
+                sex_age_text = get_val("sex_age", "牡4")
                 sex = sex_age_text[0] if sex_age_text else "牡"
                 age_match = re.search(r"\d+", sex_age_text)
                 age = int(age_match.group(0)) if age_match else 4
 
-                handicap_text = cols[5].get_text(strip=True)
+                # Handicap Weight
+                handicap_text = get_val("handicap_weight", "57.0")
                 try:
                     handicap_weight = float(handicap_text)
                 except ValueError:
                     handicap_weight = 57.0
 
-                jockey_name = cols[6].get_text(strip=True)
-                trainer_name = "未定"
-                if len(cols) > 13:
-                    trainer_name = cols[13].get_text(strip=True)
+                jockey_name = get_val("jockey_name", "騎手")
+                trainer_name_raw = get_val("trainer_name", "調教師")
+                trainer_name = re.sub(r"\[.+?\]", "", trainer_name_raw).strip()
 
-                finish_time = cols[7].get_text(strip=True) if len(cols) > 7 else None
-                margin = cols[8].get_text(strip=True) if len(cols) > 8 else None
+                finish_time = get_val("finish_time") or None
+                margin = get_val("margin") or None
 
-                # Odds & popularity
-                odds = 1.0
-                popularity = None
-                if len(cols) > 9:
-                    odds_text = cols[9].get_text(strip=True)
-                    try:
-                        odds = float(odds_text)
-                    except ValueError:
-                        odds = 1.0
+                # Odds & Popularity
+                odds_text = get_val("odds", "1.0").replace(",", "")
+                try:
+                    odds = float(odds_text)
+                except ValueError:
+                    odds = 1.0
 
-                if len(cols) > 10:
-                    pop_text = cols[10].get_text(strip=True)
-                    if pop_text.isdigit():
-                        popularity = int(pop_text)
+                pop_text = get_val("popularity", "")
+                popularity = int(pop_text) if pop_text.isdigit() else None
 
-                # Horse weight & diff
+                # Horse Weight & Diff
+                weight_text = get_val("horse_weight", "500")
                 horse_weight = 500
                 horse_weight_diff = 0
-                if len(cols) > 11:
-                    weight_text = cols[11].get_text(strip=True)
-                    w_match = re.search(r"(\d{3})(?:\(([+-]?\d+)\))?", weight_text)
-                    if w_match:
-                        horse_weight = int(w_match.group(1))
-                        if w_match.group(2):
-                            horse_weight_diff = int(w_match.group(2))
+                w_match = re.search(r"(\d{3})(?:\(([+-]?\d+)\))?", weight_text)
+                if w_match:
+                    horse_weight = int(w_match.group(1))
+                    if w_match.group(2):
+                        horse_weight_diff = int(w_match.group(2))
 
                 entries.append({
                     "race_id": race_id,
