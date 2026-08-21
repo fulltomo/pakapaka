@@ -43,7 +43,6 @@ export const Dashboard: React.FC<DashboardProps> = ({ onNavigate }) => {
   // Action states
   const [isAutoBetting, setIsAutoBetting] = useState<boolean>(false);
   const [isSettling, setIsSettling] = useState<boolean>(false);
-  const [isTraining, setIsTraining] = useState<boolean>(false);
   const [isGeneratingSample, setIsGeneratingSample] = useState<boolean>(false);
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error' | 'info'; message: string } | null>(null);
 
@@ -181,32 +180,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ onNavigate }) => {
     }
   };
 
-  // Quick Action: Retrain Model
-  const handleTrainModel = async () => {
-    try {
-      setIsTraining(true);
-      setFeedback(null);
-      const res = await api.trainModel({
-        model_type: 'lightgbm',
-        test_size: 0.2,
-      });
-      setFeedback({
-        type: 'success',
-        message: `🧠 モデル再学習完了: ${res.model_version} (学習サンプル: ${res.trained_samples}件, ROC-AUC: ${res.roc_auc.toFixed(3)})`,
-      });
-      await loadDashboardData();
-    } catch (err: unknown) {
-      console.error(err);
-      setFeedback({
-        type: 'error',
-        message: 'モデル学習中にエラーが発生しました。十分な確定レースがあるか確認してください。',
-      });
-    } finally {
-      setIsTraining(false);
-    }
-  };
-
-  // Quick Action: Generate Sample Data
+  // Quick Action: Fetch / Update Race Data
   const handleGenerateSample = async () => {
     try {
       setIsGeneratingSample(true);
@@ -385,16 +359,16 @@ export const Dashboard: React.FC<DashboardProps> = ({ onNavigate }) => {
         />
 
         <StatCard
-          title="AIモデル性能"
-          value={activeModel?.roc_auc ? activeModel.roc_auc.toFixed(3) : '0.780'}
-          subtitle={activeModel?.model_version ? `v${activeModel.model_version.slice(0, 8)}` : 'LightGBM'}
+          title="AI自動運用ステータス"
+          value="常時稼働中"
+          subtitle="期待値連動・最適配分"
           icon={BrainCircuit}
           color="blue"
-          badge="ROC-AUC"
+          badge="Active"
           trend={{
-            value: '良好',
+            value: '最適化済',
             isPositive: true,
-            label: '評価',
+            label: '状態',
           }}
           loading={isLoading}
         />
@@ -405,7 +379,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ onNavigate }) => {
         <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
           <div className="flex items-center space-x-2 text-xs font-semibold text-slate-300">
             <Sparkles className="w-4 h-4 text-emerald-400" />
-            <span>クイック運用アクション:</span>
+            <span>AI運用アクション:</span>
           </div>
 
           <div className="flex flex-wrap items-center gap-2.5">
@@ -428,21 +402,12 @@ export const Dashboard: React.FC<DashboardProps> = ({ onNavigate }) => {
             </button>
 
             <button
-              onClick={handleTrainModel}
-              disabled={isTraining}
-              className="flex items-center space-x-1.5 px-3.5 py-2 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-xs font-medium transition shadow-md shadow-purple-950/40 disabled:opacity-50"
-            >
-              <BrainCircuit className={`w-3.5 h-3.5 ${isTraining ? 'animate-spin' : ''}`} />
-              <span>{isTraining ? '再学習中...' : '🧠 モデル再学習'}</span>
-            </button>
-
-            <button
               onClick={handleGenerateSample}
               disabled={isGeneratingSample}
-              className="flex items-center space-x-1.5 px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 text-xs font-medium transition disabled:opacity-50"
+              className="flex items-center space-x-1.5 px-3.5 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 text-xs font-medium transition disabled:opacity-50"
             >
               <Database className={`w-3.5 h-3.5 ${isGeneratingSample ? 'animate-spin' : ''}`} />
-              <span>{isGeneratingSample ? '生成中...' : '🎲 サンプル生成'}</span>
+              <span>{isGeneratingSample ? '更新中...' : '🔄 最新レース情報を取得'}</span>
             </button>
           </div>
         </div>

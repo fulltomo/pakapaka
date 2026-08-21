@@ -3,8 +3,6 @@ import { Navbar, NavTab } from './components/Navbar';
 import { Dashboard } from './pages/Dashboard';
 import { Races } from './pages/Races';
 import { Simulation } from './pages/Simulation';
-import { Backtest } from './pages/Backtest';
-import { Models } from './pages/Models';
 import { WalletSession } from './types';
 import { api } from './services/api';
 
@@ -45,8 +43,6 @@ export const App: React.FC = () => {
         {activeTab === 'dashboard' && <Dashboard onNavigate={setActiveTab} />}
         {activeTab === 'races' && <Races />}
         {activeTab === 'simulation' && <Simulation />}
-        {activeTab === 'backtest' && <Backtest />}
-        {activeTab === 'models' && <Models />}
       </main>
 
       {/* Footer */}

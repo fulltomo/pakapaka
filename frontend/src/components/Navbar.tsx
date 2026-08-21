@@ -2,9 +2,6 @@ import React from 'react';
 import {
   LayoutDashboard,
   Trophy,
-  PlayCircle,
-  BarChart3,
-  BrainCircuit,
   Wallet,
   TrendingUp,
   TrendingDown,
@@ -12,7 +9,7 @@ import {
 } from 'lucide-react';
 import { WalletSession } from '../types';
 
-export type NavTab = 'dashboard' | 'races' | 'simulation' | 'backtest' | 'models';
+export type NavTab = 'dashboard' | 'races' | 'simulation';
 
 interface NavbarProps {
   activeTab: NavTab;
@@ -30,11 +27,9 @@ export const Navbar: React.FC<NavbarProps> = ({
   onRefreshWallet,
 }) => {
   const navItems: { id: NavTab; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
-    { id: 'dashboard', label: 'ダッシュボード', icon: LayoutDashboard },
-    { id: 'races', label: 'レース・AI予想', icon: Trophy },
-    { id: 'simulation', label: 'リアルタイム運用', icon: PlayCircle },
-    { id: 'backtest', label: 'バックテスト', icon: BarChart3 },
-    { id: 'models', label: 'モデル管理', icon: BrainCircuit },
+    { id: 'dashboard', label: '運用ダッシュボード', icon: LayoutDashboard },
+    { id: 'races', label: 'AI競馬予報 (出走表)', icon: Trophy },
+    { id: 'simulation', label: 'AI運用履歴・実績', icon: TrendingUp },
   ];
 
   const currentPoints = wallet?.current_points ?? 100000;
