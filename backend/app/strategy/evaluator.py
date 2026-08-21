@@ -202,6 +202,7 @@ class BacktestEngine:
 
                 bets_log.append({
                     "race_id": race.id,
+                    "race_name": race.race_name,
                     "date": race.date,
                     "horse_number": cand.horse_number,
                     "horse_name": cand.horse_name,
