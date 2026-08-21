@@ -83,14 +83,17 @@ def main():
     parser = argparse.ArgumentParser(description="Scrape real JRA race data and train LightGBM model")
     parser.add_argument("--start-year", type=int, default=2021, help="Start year (e.g. 2021)")
     parser.add_argument("--end-year", type=int, default=2026, help="End year (e.g. 2026)")
-    parser.add_argument("--max-races", type=int, default=200, help="Maximum number of real races to scrape")
-    parser.add_argument("--delay", type=float, default=0.2, help="Polite delay between HTTP requests in seconds")
+    parser.add_argument("--max-races", type=int, default=2000, help="Maximum number of real races to scrape")
+    parser.add_argument("--min-delay", type=float, default=1.2, help="Minimum jitter delay between requests in seconds")
+    parser.add_argument("--max-delay", type=float, default=2.2, help="Maximum jitter delay between requests in seconds")
+    parser.add_argument("--delay", type=float, default=1.5, help="Fallback delay if jitter not used")
     parser.add_argument("--clear-db", action="store_true", help="Clear existing database tables before import")
     args = parser.parse_args()
 
     print("=" * 70)
     print("🏇 PakaPaka - 過去数年分リアル競馬データ収集＆AIモデル本番学習")
     print(f"   対象期間: {args.start_year}年 〜 {args.end_year}年 (最大 {args.max_races} レース)")
+    print(f"   安全リクエスト間隔: {args.min_delay}秒 〜 {args.max_delay}秒 (ランダムJitter)")
     print("=" * 70)
 
     # 1. Database initialization
@@ -101,7 +104,7 @@ def main():
     init_db()
 
     db: Session = SessionLocal()
-    scraper = NetkeibaScraper(rate_limit_delay=args.delay)
+    scraper = NetkeibaScraper(min_delay=args.min_delay, max_delay=args.max_delay)
 
     # 2. Race ID Discovery across years
     print(f"\n[2/5] {args.start_year}年〜{args.end_year}年のリアルレースIDを探索中...")

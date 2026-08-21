@@ -27,40 +27,62 @@ class NetkeibaScraper:
     def __init__(
         self,
         cache: Optional[HTMLCache] = None,
-        rate_limit_delay: float = 1.0,
-        timeout: float = 10.0,
+        rate_limit_delay: float = 1.2,
+        min_delay: float = 1.0,
+        max_delay: float = 2.2,
+        timeout: float = 15.0,
+        max_retries: int = 3,
     ):
         self.cache = cache if cache is not None else HTMLCache()
         self.rate_limit_delay = rate_limit_delay
+        self.min_delay = min_delay
+        self.max_delay = max_delay
         self.timeout = timeout
+        self.max_retries = max_retries
         self._last_request_time: float = 0.0
 
     def fetch_race_html(self, race_id: str, use_cache: bool = True) -> Optional[str]:
         """
-        Fetches HTML for a given race ID, checking cache first and rate-limiting live requests.
+        Fetches HTML for a given race ID with random jitter delay, local cache, and retry on rate-limiting.
         """
+        import random
         if use_cache and self.cache.has(race_id):
             return self.cache.get(race_id)
 
-        # Rate limiting check
+        # Rate limiting check with random jitter
+        target_delay = random.uniform(self.min_delay, self.max_delay) if self.max_delay > self.min_delay else self.rate_limit_delay
         elapsed = time.time() - self._last_request_time
-        if elapsed < self.rate_limit_delay:
-            time.sleep(self.rate_limit_delay - elapsed)
+        if elapsed < target_delay:
+            time.sleep(target_delay - elapsed)
 
         url = self.BASE_DB_URL.format(race_id=race_id)
-        try:
-            with httpx.Client(timeout=self.timeout, headers=self.DEFAULT_HEADERS) as client:
-                response = client.get(url)
-                self._last_request_time = time.time()
-                if response.status_code != 200:
+        
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                with httpx.Client(timeout=self.timeout, headers=self.DEFAULT_HEADERS) as client:
+                    response = client.get(url)
+                    self._last_request_time = time.time()
+
+                    # Handle Rate-Limiting / Server Busy (429 or 503)
+                    if response.status_code in (429, 503):
+                        backoff = 20.0 * attempt
+                        print(f"  [Scraper Warning] Rate limited ({response.status_code}). Backing off for {backoff}s before retry {attempt}/{self.max_retries}...")
+                        time.sleep(backoff)
+                        continue
+
+                    if response.status_code != 200:
+                        return None
+
+                    # netkeiba uses euc-jp encoding
+                    content = response.content.decode("euc-jp", errors="replace")
+                    if use_cache:
+                        self.cache.set(race_id, content)
+                    return content
+            except Exception as e:
+                if attempt == self.max_retries:
                     return None
-                # netkeiba uses euc-jp encoding
-                content = response.content.decode("euc-jp", errors="replace")
-                if use_cache:
-                    self.cache.set(race_id, content)
-                return content
-        except Exception:
-            return None
+                time.sleep(5.0 * attempt)
+        return None
 
     def _parse_race_metadata(self, soup: BeautifulSoup, race_id: str) -> Dict[str, Any]:
         """

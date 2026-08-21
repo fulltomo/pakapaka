@@ -1,0 +1,102 @@
+name: Scrape Real Data & Train AI Model
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_year:
+        description: '開始年 (Start Year)'
+        required: true
+        default: '2021'
+        type: string
+      end_year:
+        description: '終了年 (End Year)'
+        required: true
+        default: '2026'
+        type: string
+      max_races:
+        description: '最大収集レース数 (Max Races to Scrape)'
+        required: true
+        default: '2000'
+        type: string
+      min_delay:
+        description: '最小リクエスト間隔 秒 (Min Delay Seconds)'
+        required: true
+        default: '1.2'
+        type: string
+      max_delay:
+        description: '最大リクエスト間隔 秒 (Max Delay Seconds)'
+        required: true
+        default: '2.2'
+        type: string
+  schedule:
+    # 毎週日曜 18:00 UTC (日本時間 月曜 午前3:00) に自動実行して最新レースを蓄積・再学習
+    - cron: '0 18 * * 0'
+
+jobs:
+  scrape-and-train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 # 最大6時間連続稼働
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      - name: Run Real Data Scraping & LightGBM Training
+        run: |
+          mkdir -p data/models data/cache
+          python backend/scripts/scrape_real_data.py \
+            --start-year ${{ inputs.start_year || '2021' }} \
+            --end-year ${{ inputs.end_year || '2026' }} \
+            --max-races ${{ inputs.max_races || '2000' }} \
+            --min-delay ${{ inputs.min_delay || '1.2' }} \
+            --max-delay ${{ inputs.max_delay || '2.2' }}
+
+      - name: Package Database & Model Artifacts
+        run: |
+          tar -czf pakapaka_real_dataset.tar.gz pakapaka.db data/models/latest_model.joblib
+
+      - name: Upload Dataset & Model Artifacts (Build Artifacts)
+        uses: actions/upload-artifact@v4
+        with:
+          name: pakapaka-real-data-and-model
+          path: |
+            pakapaka.db
+            data/models/latest_model.joblib
+            pakapaka_real_dataset.tar.gz
+          retention-days: 90
+
+      - name: Release Dataset & Model (GitHub Releases)
+        if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest-real-data
+          name: "🏇 PakaPaka Real Dataset & AI Model (${{ inputs.start_year || '2021' }}-${{ inputs.end_year || '2026' }})"
+          body: |
+            ## 🏇 PakaPaka AI 競馬データ＆学習済みモデル
+
+            - **対象期間**: ${{ inputs.start_year || '2021' }}年 〜 ${{ inputs.end_year || '2026' }}年
+            - **収集データ**: JRA公式確定レース・出走馬・オッズ・払戻金
+            - **学習モデル**: LightGBM Calibrated Classifier (最新版)
+            - **生成日時**: ${{ github.event.head_commit.timestamp || github.sha }}
+
+            ### ローカルへの適用手順
+            1. 添付の `pakapaka_real_dataset.tar.gz` をダウンロードしてプロジェクトルートに解凍
+            2. `tar -xzf pakapaka_real_dataset.tar.gz`
+            3. アプリを起動するだけで、5年分の実データ・本番モデルで即座に稼働します。
+          files: |
+            pakapaka_real_dataset.tar.gz
+            pakapaka.db
+            data/models/latest_model.joblib
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
