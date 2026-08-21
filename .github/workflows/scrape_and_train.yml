@@ -53,6 +53,9 @@ jobs:
           pip install -r backend/requirements.txt
 
       - name: Run Real Data Scraping & LightGBM Training
+        env:
+          MODEL_DIR: data/models
+          CACHE_DIR: data/cache
         run: |
           mkdir -p data/models data/cache
           python backend/scripts/scrape_real_data.py \
