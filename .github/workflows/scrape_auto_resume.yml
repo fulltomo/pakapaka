@@ -1,0 +1,132 @@
+name: Auto Resume Scraping Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_year:
+        description: "開始年 (Start Year)"
+        required: true
+        default: "2021"
+        type: string
+      end_year:
+        description: "終了年 (End Year)"
+        required: true
+        default: "2026"
+        type: string
+      max_races:
+        description: "収集目標レース数 (Max Races in total)"
+        required: true
+        default: "5000"
+        type: string
+      time_limit_minutes:
+        description: "1回の最大実行時間(分) (Time limit before checkpoint & restart)"
+        required: true
+        default: "320" # 5時間20分 (GitHub Actionsの6時間上限前に安全に終了)
+        type: string
+      skip_train_until_end:
+        description: "中間実行時はモデル学習をスキップし全件完了時のみ学習する"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  scrape-and-resume:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350 # 5時間50分 (ジョブ自体の非常停止ガード)
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore existing DB from data branch
+        run: |
+          echo "=== 既存データの復元 ==="
+          if git ls-remote --heads origin data | grep -q 'refs/heads/data'; then
+            echo "リモートの data ブランチから前回のデータベース (pakapaka.db) を復元します..."
+            git fetch origin data:data
+            git checkout data -- backend/pakapaka.db || true
+            if [ -f backend/pakapaka.db ]; then
+              echo "✓ 前回のデータベースを正常に復元しました (サイズ: $(ls -lh backend/pakapaka.db | awk '{print $5}'))"
+            fi
+          else
+            echo "data ブランチが存在しないため、新規データベースで開始します。"
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      - name: Run Scraping Pipeline with Time Limit
+        id: scraper
+        run: |
+          echo "=== スクレイピング開始 (制限時間: ${{ inputs.time_limit_minutes }}分) ==="
+          OPT_FLAGS=""
+          if [ "${{ inputs.skip_train_until_end }}" = "true" ]; then
+            OPT_FLAGS="--skip-train"
+          fi
+
+          python backend/scripts/scrape_real_data.py \
+            --start-year "${{ inputs.start_year }}" \
+            --end-year "${{ inputs.end_year }}" \
+            --max-races "${{ inputs.max_races }}" \
+            --time-limit-minutes "${{ inputs.time_limit_minutes }}" \
+            $OPT_FLAGS
+
+      - name: Checkpoint DB to data branch
+        if: always()
+        run: |
+          echo "=== データのチェックポイント保存 ==="
+          if [ -f backend/pakapaka.db ]; then
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+            # 孤立ブランチ (orphan) を作成し、履歴肥大化を防ぎつつ最新DBのみコミット
+            git checkout --orphan data-temp
+            git rm -rf . > /dev/null 2>&1 || true
+            git add -f backend/pakapaka.db
+
+            if [ -d backend/models ]; then
+              git add -f backend/models/ || true
+            fi
+
+            STATUS_MSG="Auto-checkpoint: ${{ steps.scraper.outputs.scraped_count }}/${{ steps.scraper.outputs.total_target }} races [skip ci]"
+            git commit -m "$STATUS_MSG"
+            git branch -D data > /dev/null 2>&1 || true
+            git branch -m data
+            git push origin data --force
+            echo "✓ data ブランチへ最新データを force push しました。"
+          else
+            echo "保存対象の pakapaka.db が見つかりませんでした。"
+          fi
+
+      - name: Auto-retrigger next run if more races remaining
+        if: steps.scraper.outputs.has_more == 'true'
+        env:
+          # PAT (Personal Access Token) が登録されていればそちらを優先 (GITHUB_TOKENでは連鎖トリガー不可のため)
+          AUTH_TOKEN: ${{ secrets.AUTO_RESUME_TOKEN || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== 次回実行の自動トリガー ==="
+          echo "未収集レースが残っているため (${{ steps.scraper.outputs.scraped_count }}/${{ steps.scraper.outputs.total_target }} 件)、次回のワークフローを自動起動します。"
+
+          export GH_TOKEN="$AUTH_TOKEN"
+          gh workflow run scrape_auto_resume.yml \
+            -f start_year="${{ inputs.start_year }}" \
+            -f end_year="${{ inputs.end_year }}" \
+            -f max_races="${{ inputs.max_races }}" \
+            -f time_limit_minutes="${{ inputs.time_limit_minutes }}" \
+            -f skip_train_until_end="${{ inputs.skip_train_until_end }}"
+
+          echo "✓ 次回ジョブの起動リクエストを送信しました！"

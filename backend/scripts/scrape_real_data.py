@@ -79,6 +79,14 @@ def discover_race_ids_for_date(date_str: str, client: httpx.Client) -> List[str]
         return []
 
 
+def set_github_output(name: str, value: str):
+    """Helper to set GitHub Actions step output."""
+    output_path = os.environ.get("GITHUB_OUTPUT")
+    if output_path:
+        with open(output_path, "a", encoding="utf-8") as f:
+            f.write(f"{name}={value}\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Scrape real JRA race data and train LightGBM model")
     parser.add_argument("--start-year", type=int, default=2021, help="Start year (e.g. 2021)")
@@ -87,13 +95,19 @@ def main():
     parser.add_argument("--min-delay", type=float, default=1.2, help="Minimum jitter delay between requests in seconds")
     parser.add_argument("--max-delay", type=float, default=2.2, help="Maximum jitter delay between requests in seconds")
     parser.add_argument("--delay", type=float, default=1.5, help="Fallback delay if jitter not used")
+    parser.add_argument("--time-limit-minutes", type=float, default=320.0, help="Time limit in minutes before graceful shutdown (default: 320 = 5h20m, 0 to disable)")
     parser.add_argument("--clear-db", action="store_true", help="Clear existing database tables before import")
+    parser.add_argument("--skip-train", action="store_true", help="Skip training LightGBM model and backtest")
     args = parser.parse_args()
+
+    start_time = time.time()
 
     print("=" * 70)
     print("🏇 PakaPaka - 過去数年分リアル競馬データ収集＆AIモデル本番学習")
     print(f"   対象期間: {args.start_year}年 〜 {args.end_year}年 (最大 {args.max_races} レース)")
     print(f"   安全リクエスト間隔: {args.min_delay}秒 〜 {args.max_delay}秒 (ランダムJitter)")
+    if args.time_limit_minutes > 0:
+        print(f"   制限時間: {args.time_limit_minutes:.1f}分 (タイムリミット到達で安全に中断＆引き継ぎ)")
     print("=" * 70)
 
     # 1. Database initialization
@@ -130,8 +144,18 @@ def main():
     scraped_count = 0
     total_entries = 0
     total_payouts = 0
+    interrupted_by_timeout = False
 
     for i, race_id in enumerate(all_race_ids, 1):
+        # Check time limit
+        if args.time_limit_minutes > 0:
+            elapsed_min = (time.time() - start_time) / 60.0
+            if elapsed_min >= args.time_limit_minutes:
+                print(f"\n⏰ 制限時間 ({args.time_limit_minutes:.1f}分) に到達しました (経過: {elapsed_min:.1f}分)。")
+                print("   安全にデータベースをコミットして処理を一時中断し、次回ジョブへ引き継ぎます...")
+                interrupted_by_timeout = True
+                break
+
         try:
             # Check if race already in DB
             existing = db.query(Race).filter_by(id=race_id).first()
@@ -152,7 +176,29 @@ def main():
             print(f"  [Error] Failed to process {race_id}: {e}")
             continue
 
-    print(f"  ✓ リアルデータ収集完了: {scraped_count} レース, {total_entries} 出走頭数, {total_payouts} 払戻レコード")
+    print(f"  ✓ リアルデータ収集状況: {scraped_count}/{len(all_race_ids)} レース収集完了 ({total_entries} 出走頭数, {total_payouts} 払戻レコード)")
+
+    has_more = (scraped_count < len(all_race_ids)) or interrupted_by_timeout
+    set_github_output("has_more", "true" if has_more else "false")
+    set_github_output("scraped_count", str(scraped_count))
+    set_github_output("total_target", str(len(all_race_ids)))
+
+    if interrupted_by_timeout or (args.skip_train and has_more):
+        db.commit()
+        db.close()
+        print("\n" + "=" * 70)
+        print(f"⏸️ 今回のスクレイピングを中断しました (収集済: {scraped_count}/{len(all_race_ids)} 件)。")
+        print("   自動再実行ワークフローにより続きから再開されます。")
+        print("=" * 70)
+        return
+
+    if args.skip_train:
+        db.commit()
+        db.close()
+        print("\n" + "=" * 70)
+        print("✓ スクレイピング完了 (--skip-train によりモデル学習をスキップしました)")
+        print("=" * 70)
+        return
 
     # 4. Training LightGBM Model on Real Data
     print("\n[4/5] リアルデータによる LightGBM モデルの学習 ＆ 確率キャリブレーション...")
