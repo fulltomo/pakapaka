@@ -50,9 +50,12 @@ jobs:
           if git ls-remote --heads origin data | grep -q 'refs/heads/data'; then
             echo "リモートの data ブランチから前回のデータベース (pakapaka.db) を復元します..."
             git fetch origin data:data
-            git checkout data -- backend/pakapaka.db || true
-            if [ -f backend/pakapaka.db ]; then
-              echo "✓ 前回のデータベースを正常に復元しました (サイズ: $(ls -lh backend/pakapaka.db | awk '{print $5}'))"
+            git checkout data -- pakapaka.db 2>/dev/null || git checkout data -- backend/pakapaka.db 2>/dev/null || true
+            if [ -f backend/pakapaka.db ] && [ ! -f pakapaka.db ]; then
+              cp backend/pakapaka.db pakapaka.db
+            fi
+            if [ -f pakapaka.db ]; then
+              echo "✓ 前回のデータベースを正常に復元しました (サイズ: $(ls -lh pakapaka.db | awk '{print $5}'))"
             fi
           else
             echo "data ブランチが存在しないため、新規データベースで開始します。"
@@ -73,6 +76,7 @@ jobs:
         id: scraper
         run: |
           echo "=== スクレイピング開始 (制限時間: ${{ inputs.time_limit_minutes }}分) ==="
+          mkdir -p data/models data/cache backend/data/models backend/data/cache
           OPT_FLAGS=""
           if [ "${{ inputs.skip_train_until_end }}" = "true" ]; then
             OPT_FLAGS="--skip-train"
@@ -89,17 +93,27 @@ jobs:
         if: always()
         run: |
           echo "=== データのチェックポイント保存 ==="
-          if [ -f backend/pakapaka.db ]; then
+          DB_FILE=""
+          if [ -f pakapaka.db ]; then
+            DB_FILE="pakapaka.db"
+          elif [ -f backend/pakapaka.db ]; then
+            DB_FILE="backend/pakapaka.db"
+          fi
+
+          if [ -n "$DB_FILE" ]; then
             git config --global user.name "github-actions[bot]"
             git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
             # 孤立ブランチ (orphan) を作成し、履歴肥大化を防ぎつつ最新DBのみコミット
             git checkout --orphan data-temp
             git rm -rf . > /dev/null 2>&1 || true
-            git add -f backend/pakapaka.db
+            git add -f "$DB_FILE"
 
-            if [ -d backend/models ]; then
-              git add -f backend/models/ || true
+            if [ -d data/models ]; then
+              git add -f data/models/ || true
+            fi
+            if [ -d backend/data/models ]; then
+              git add -f backend/data/models/ || true
             fi
 
             STATUS_MSG="Auto-checkpoint: ${{ steps.scraper.outputs.scraped_count }}/${{ steps.scraper.outputs.total_target }} races [skip ci]"

@@ -35,9 +35,10 @@ from app.strategy.evaluator import BacktestEngine, BacktestConfig
 from app.strategy.simulator import ForwardSimulator
 
 
-def get_weekend_dates(start_year: int = 2021, end_year: int = 2026, max_days: int = 50) -> List[str]:
+def get_weekend_dates(start_year: int = 2021, end_year: int = 2026, max_days: int = 0) -> List[str]:
     """
     Generates a list of Saturday/Sunday YYYYMMDD date strings for major race days across the multi-year range.
+    If max_days is 0 or None, returns all weekend dates.
     """
     dates = []
     cur = datetime(start_year, 1, 1)
@@ -122,8 +123,8 @@ def main():
 
     # 2. Race ID Discovery across years
     print(f"\n[2/5] {args.start_year}年〜{args.end_year}年のリアルレースIDを探索中...")
-    target_dates = get_weekend_dates(args.start_year, args.end_year, max_days=60)
-    print(f"  - 探索対象開催日: {len(target_dates)} 日間 ({args.start_year}年〜{args.end_year}年の主要週末)")
+    target_dates = get_weekend_dates(args.start_year, args.end_year, max_days=0)
+    print(f"  - 探索対象開催日: {len(target_dates)} 日間 ({args.start_year}年〜{args.end_year}年の全週末)")
 
     all_race_ids: List[str] = []
     with httpx.Client(timeout=10.0) as client:
@@ -183,7 +184,7 @@ def main():
     set_github_output("scraped_count", str(scraped_count))
     set_github_output("total_target", str(len(all_race_ids)))
 
-    if interrupted_by_timeout or (args.skip_train and has_more):
+    if interrupted_by_timeout or (has_more and args.skip_train):
         db.commit()
         db.close()
         print("\n" + "=" * 70)
@@ -196,7 +197,7 @@ def main():
         db.commit()
         db.close()
         print("\n" + "=" * 70)
-        print("✓ スクレイピング完了 (--skip-train によりモデル学習をスキップしました)")
+        print("✓ 全件スクレイピング完了 (--skip-train によりモデル学習をスキップしました)")
         print("=" * 70)
         return
 
