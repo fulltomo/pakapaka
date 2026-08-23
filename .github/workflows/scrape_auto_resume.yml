@@ -61,6 +61,7 @@ jobs:
             echo "リモートの data ブランチから前回のデータベース (pakapaka.db) を復元します..."
             git fetch origin data:data
             git checkout data -- pakapaka.db 2>/dev/null || git checkout data -- backend/pakapaka.db 2>/dev/null || true
+            git reset HEAD pakapaka.db 2>/dev/null || true
             if [ -f backend/pakapaka.db ] && [ ! -f pakapaka.db ]; then
               cp backend/pakapaka.db pakapaka.db
             fi
@@ -113,22 +114,39 @@ jobs:
           fi
 
           if [ -n "$DB_FILE" ]; then
+            # 1. 安全のため /tmp に二重バックアップ
+            cp "$DB_FILE" /tmp/pakapaka_backup.db
+            if [ -d data/models ]; then
+              cp -r data/models /tmp/models_backup
+            fi
+            if [ -d backend/data/models ]; then
+              cp -r backend/data/models /tmp/backend_models_backup
+            fi
+
             git config --global user.name "github-actions[bot]"
             git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-            # 孤立ブランチ (orphan) を作成し、履歴肥大化を防ぎつつ最新DBのみコミット
+            # 2. 孤立ブランチ (orphan) を作成
             git checkout --orphan data-temp
-            git rm -rf . > /dev/null 2>&1 || true
-            git add -f "$DB_FILE"
+            # 3. インデックスのみを初期化 (作業ディレクトリの実ファイルは絶対に消さない)
+            git rm --cached -r . > /dev/null 2>&1 || true
 
-            if [ -d data/models ]; then
+            # 4. 退避したDBを確実に配置してコミット
+            cp /tmp/pakapaka_backup.db pakapaka.db
+            git add -f pakapaka.db
+
+            if [ -d /tmp/models_backup ]; then
+              mkdir -p data/models
+              cp -r /tmp/models_backup/* data/models/ 2>/dev/null || true
               git add -f data/models/ || true
             fi
-            if [ -d backend/data/models ]; then
+            if [ -d /tmp/backend_models_backup ]; then
+              mkdir -p backend/data/models
+              cp -r /tmp/backend_models_backup/* backend/data/models/ 2>/dev/null || true
               git add -f backend/data/models/ || true
             fi
 
-            STATUS_MSG="Auto-checkpoint: ${{ steps.scraper.outputs.scraped_count }}/${{ steps.scraper.outputs.total_target }} races (Gen ${{ inputs.iteration }}) [skip ci]"
+            STATUS_MSG="Auto-checkpoint: ${{ steps.scraper.outputs.scraped_count || 'partial' }}/${{ steps.scraper.outputs.total_target || 'all' }} races (Gen ${{ inputs.iteration }}) [skip ci]"
             git commit -m "$STATUS_MSG"
             git branch -D data > /dev/null 2>&1 || true
             git branch -m data
@@ -137,6 +155,17 @@ jobs:
           else
             echo "保存対象の pakapaka.db が見つかりませんでした。"
           fi
+
+      - name: Upload DB Artifact (Backup Guard)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pakapaka-db-checkpoint-gen-${{ inputs.iteration }}
+          path: |
+            pakapaka.db
+            backend/pakapaka.db
+          retention-days: 90
+          if-no-files-found: ignore
 
       - name: Auto-retrigger next run if more races remaining
         if: steps.scraper.outputs.has_more == 'true'
