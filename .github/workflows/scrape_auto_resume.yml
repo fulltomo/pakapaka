@@ -14,14 +14,24 @@ on:
         default: "2026"
         type: string
       max_races:
-        description: "収集目標レース数 (Max Races in total)"
+        description: "収集目標レース数 (0で無制限・全レース完全収集)"
         required: true
-        default: "5000"
+        default: "0"
         type: string
       time_limit_minutes:
         description: "1回の最大実行時間(分) (Time limit before checkpoint & restart)"
         required: true
         default: "320" # 5時間20分 (GitHub Actionsの6時間上限前に安全に終了)
+        type: string
+      iteration:
+        description: "現在の実行ループ回数 (世代)"
+        required: false
+        default: "1"
+        type: string
+      max_iterations:
+        description: "最大自動再実行回数 (無限ループ防止の安全停止上限)"
+        required: false
+        default: "10"
         type: string
       skip_train_until_end:
         description: "中間実行時はモデル学習をスキップし全件完了時のみ学習する"
@@ -75,7 +85,7 @@ jobs:
       - name: Run Scraping Pipeline with Time Limit
         id: scraper
         run: |
-          echo "=== スクレイピング開始 (制限時間: ${{ inputs.time_limit_minutes }}分) ==="
+          echo "=== スクレイピング開始 (制限時間: ${{ inputs.time_limit_minutes }}分, ループ: 第${{ inputs.iteration }}/${{ inputs.max_iterations }}世代) ==="
           mkdir -p data/models data/cache backend/data/models backend/data/cache
           OPT_FLAGS=""
           if [ "${{ inputs.skip_train_until_end }}" = "true" ]; then
@@ -87,6 +97,8 @@ jobs:
             --end-year "${{ inputs.end_year }}" \
             --max-races "${{ inputs.max_races }}" \
             --time-limit-minutes "${{ inputs.time_limit_minutes }}" \
+            --iteration "${{ inputs.iteration }}" \
+            --max-iterations "${{ inputs.max_iterations }}" \
             $OPT_FLAGS
 
       - name: Checkpoint DB to data branch
@@ -116,7 +128,7 @@ jobs:
               git add -f backend/data/models/ || true
             fi
 
-            STATUS_MSG="Auto-checkpoint: ${{ steps.scraper.outputs.scraped_count }}/${{ steps.scraper.outputs.total_target }} races [skip ci]"
+            STATUS_MSG="Auto-checkpoint: ${{ steps.scraper.outputs.scraped_count }}/${{ steps.scraper.outputs.total_target }} races (Gen ${{ inputs.iteration }}) [skip ci]"
             git commit -m "$STATUS_MSG"
             git branch -D data > /dev/null 2>&1 || true
             git branch -m data
@@ -133,7 +145,8 @@ jobs:
           AUTH_TOKEN: ${{ secrets.AUTO_RESUME_TOKEN || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
         run: |
           echo "=== 次回実行の自動トリガー ==="
-          echo "未収集レースが残っているため (${{ steps.scraper.outputs.scraped_count }}/${{ steps.scraper.outputs.total_target }} 件)、次回のワークフローを自動起動します。"
+          NEXT_ITERATION="${{ steps.scraper.outputs.next_iteration || '2' }}"
+          echo "未収集レースが残っているため (${{ steps.scraper.outputs.scraped_count }}/${{ steps.scraper.outputs.total_target }} 件)、次回 (第 ${NEXT_ITERATION} 世代) のワークフローを自動起動します。"
 
           export GH_TOKEN="$AUTH_TOKEN"
           gh workflow run scrape_auto_resume.yml \
@@ -141,6 +154,8 @@ jobs:
             -f end_year="${{ inputs.end_year }}" \
             -f max_races="${{ inputs.max_races }}" \
             -f time_limit_minutes="${{ inputs.time_limit_minutes }}" \
+            -f iteration="${NEXT_ITERATION}" \
+            -f max_iterations="${{ inputs.max_iterations }}" \
             -f skip_train_until_end="${{ inputs.skip_train_until_end }}"
 
-          echo "✓ 次回ジョブの起動リクエストを送信しました！"
+          echo "✓ 次回ジョブ (第 ${NEXT_ITERATION} 世代) の起動リクエストを送信しました！"

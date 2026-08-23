@@ -35,29 +35,28 @@ from app.strategy.evaluator import BacktestEngine, BacktestConfig
 from app.strategy.simulator import ForwardSimulator
 
 
-def get_weekend_dates(start_year: int = 2021, end_year: int = 2026, max_days: int = 0) -> List[str]:
+def get_target_dates(start_year: int = 2021, end_year: int = 2026) -> List[str]:
     """
-    Generates a list of Saturday/Sunday YYYYMMDD date strings for major race days across the multi-year range.
-    If max_days is 0 or None, returns all weekend dates.
+    Generates all plausible JRA race dates (Saturdays, Sundays, Mondays, Fridays, and year-end dates)
+    from start_year-01-01 up to today (capped at min(end_year, current_date)).
     """
     dates = []
     cur = datetime(start_year, 1, 1)
-    end = datetime(min(end_year, 2026), 12, 31)
+    today = datetime.now()
+    end_dt = min(datetime(end_year, 12, 31), today)
 
-    while cur <= end:
-        if cur.weekday() in (5, 6):
+    while cur <= end_dt:
+        # JRA races occur on Sat(5), Sun(6), Mon(0: holiday 3-day weekends), Fri(4), and year-end (Dec 28)
+        if cur.weekday() in (0, 4, 5, 6) or (cur.month == 12 and cur.day in (28, 29)):
             dates.append(cur.strftime("%Y%m%d"))
         cur += timedelta(days=1)
 
-    if max_days and len(dates) > max_days:
-        step = max(1, len(dates) // max_days)
-        return dates[::step][:max_days]
     return dates
 
 
 def discover_race_ids_for_date(date_str: str, client: httpx.Client) -> List[str]:
     """
-    Fetches netkeiba race list page for a specific date and returns unique 12-digit race IDs.
+    Fetches netkeiba race list page for a specific date and returns all unique 12-digit race IDs (1R to 12R).
     """
     url = f"https://db.netkeiba.com/race/list/{date_str}/"
     headers = {
@@ -92,21 +91,25 @@ def main():
     parser = argparse.ArgumentParser(description="Scrape real JRA race data and train LightGBM model")
     parser.add_argument("--start-year", type=int, default=2021, help="Start year (e.g. 2021)")
     parser.add_argument("--end-year", type=int, default=2026, help="End year (e.g. 2026)")
-    parser.add_argument("--max-races", type=int, default=2000, help="Maximum number of real races to scrape")
+    parser.add_argument("--max-races", type=int, default=0, help="Maximum races to scrape (0 for unlimited / full coverage)")
     parser.add_argument("--min-delay", type=float, default=1.2, help="Minimum jitter delay between requests in seconds")
     parser.add_argument("--max-delay", type=float, default=2.2, help="Maximum jitter delay between requests in seconds")
     parser.add_argument("--delay", type=float, default=1.5, help="Fallback delay if jitter not used")
     parser.add_argument("--time-limit-minutes", type=float, default=320.0, help="Time limit in minutes before graceful shutdown (default: 320 = 5h20m, 0 to disable)")
+    parser.add_argument("--iteration", type=int, default=1, help="Current auto-resume iteration count")
+    parser.add_argument("--max-iterations", type=int, default=10, help="Max allowed iterations to prevent infinite loops")
     parser.add_argument("--clear-db", action="store_true", help="Clear existing database tables before import")
-    parser.add_argument("--skip-train", action="store_true", help="Skip training LightGBM model and backtest")
+    parser.add_argument("--skip-train", action="store_true", help="Explicitly skip training LightGBM model and backtest")
     args = parser.parse_args()
 
     start_time = time.time()
 
     print("=" * 70)
     print("🏇 PakaPaka - 過去数年分リアル競馬データ収集＆AIモデル本番学習")
-    print(f"   対象期間: {args.start_year}年 〜 {args.end_year}年 (最大 {args.max_races} レース)")
+    print(f"   対象期間: {args.start_year}年 〜 {args.end_year}年 (本日までの全レース完全網羅)")
+    print(f"   収集上限: {'無制限 (全レース完全収集)' if args.max_races <= 0 else f'最大 {args.max_races} レース'}")
     print(f"   安全リクエスト間隔: {args.min_delay}秒 〜 {args.max_delay}秒 (ランダムJitter)")
+    print(f"   実行ループ: 第 {args.iteration} 世代 (最大 {args.max_iterations} 回で安全停止)")
     if args.time_limit_minutes > 0:
         print(f"   制限時間: {args.time_limit_minutes:.1f}分 (タイムリミット到達で安全に中断＆引き継ぎ)")
     print("=" * 70)
@@ -122,27 +125,30 @@ def main():
     scraper = NetkeibaScraper(min_delay=args.min_delay, max_delay=args.max_delay)
 
     # 2. Race ID Discovery across years
-    print(f"\n[2/5] {args.start_year}年〜{args.end_year}年のリアルレースIDを探索中...")
-    target_dates = get_weekend_dates(args.start_year, args.end_year, max_days=0)
-    print(f"  - 探索対象開催日: {len(target_dates)} 日間 ({args.start_year}年〜{args.end_year}年の全週末)")
+    print(f"\n[2/5] {args.start_year}年〜本日までのJRA全レースID (1R〜12R) を探索中...")
+    target_dates = get_target_dates(args.start_year, args.end_year)
+    print(f"  - 探索対象開催候補日: {len(target_dates)} 日間 ({args.start_year}年1月1日〜現在)")
 
     all_race_ids: List[str] = []
     with httpx.Client(timeout=10.0) as client:
         for d in target_dates:
             rids = discover_race_ids_for_date(d, client)
-            # Prioritize main / graded races (10R, 11R, 12R) for quality dataset
-            main_rids = [r for r in rids if r.endswith(("09", "10", "11", "12"))]
-            all_race_ids.extend(main_rids if main_rids else rids)
-            if len(all_race_ids) >= args.max_races:
+            # Collect 100% of all races (1R through 12R) without filtering
+            all_race_ids.extend(rids)
+            if args.max_races > 0 and len(all_race_ids) >= args.max_races:
                 break
-            time.sleep(0.15)
+            time.sleep(0.12)
 
-    all_race_ids = list(dict.fromkeys(all_race_ids))[:args.max_races]
-    print(f"  ✓ 収集対象のリアルレース: {len(all_race_ids)} 件特定")
+    all_race_ids = list(dict.fromkeys(all_race_ids))
+    if args.max_races > 0:
+        all_race_ids = all_race_ids[:args.max_races]
+
+    print(f"  ✓ 収集対象の全リアルレース: {len(all_race_ids)} 件特定")
 
     # 3. Scraping & Saving Real Races
     print(f"\n[3/5] netkeibaからリアルレース・出走馬・オッズ・払戻金をスクレイピング中...")
     scraped_count = 0
+    newly_scraped = 0
     total_entries = 0
     total_payouts = 0
     interrupted_by_timeout = False
@@ -169,27 +175,42 @@ def main():
             race = scraper.scrape_race_and_save(race_id, db, use_cache=True)
             if race:
                 scraped_count += 1
+                newly_scraped += 1
                 total_entries += len(race.entries)
                 total_payouts += len(race.payouts)
-                if i % 15 == 0 or i == len(all_race_ids):
-                    print(f"  [{i}/{len(all_race_ids)}] ✓ {race.date} {race.race_course}{race.race_number}R {race.race_name} ({len(race.entries)}頭, 払戻{len(race.payouts)}件)")
+                if newly_scraped % 20 == 0 or i == len(all_race_ids):
+                    print(f"  [{scraped_count}/{len(all_race_ids)}] ✓ {race.date} {race.race_course}{race.race_number}R {race.race_name} ({len(race.entries)}頭, 払戻{len(race.payouts)}件)")
         except Exception as e:
             print(f"  [Error] Failed to process {race_id}: {e}")
             continue
 
-    print(f"  ✓ リアルデータ収集状況: {scraped_count}/{len(all_race_ids)} レース収集完了 ({total_entries} 出走頭数, {total_payouts} 払戻レコード)")
+    print(f"  ✓ リアルデータ収集状況: {scraped_count}/{len(all_race_ids)} レース収集完了 (今回新規: {newly_scraped} 件)")
 
-    has_more = (scraped_count < len(all_race_ids)) or interrupted_by_timeout
+    # Infinite Loop Prevention Logic:
+    has_more = (scraped_count < len(all_race_ids))
+
+    if has_more:
+        # Guard 1: Zero progress detection (avoid re-running endlessly if all remaining races fail)
+        if interrupted_by_timeout and newly_scraped == 0:
+            print("\n⚠️ 【無限ループ防止】今回の実行で新規取得レースが0件のため、自動再実行を安全に停止します。")
+            has_more = False
+        # Guard 2: Max iterations limit
+        elif args.iteration >= args.max_iterations:
+            print(f"\n⚠️ 【無限ループ防止】最大再帰回数 ({args.max_iterations}回) に到達したため、自動再実行を停止します。")
+            has_more = False
+
     set_github_output("has_more", "true" if has_more else "false")
     set_github_output("scraped_count", str(scraped_count))
     set_github_output("total_target", str(len(all_race_ids)))
+    set_github_output("newly_scraped", str(newly_scraped))
+    set_github_output("next_iteration", str(args.iteration + 1))
 
-    if interrupted_by_timeout or (has_more and args.skip_train):
+    if has_more:
         db.commit()
         db.close()
         print("\n" + "=" * 70)
-        print(f"⏸️ 今回のスクレイピングを中断しました (収集済: {scraped_count}/{len(all_race_ids)} 件)。")
-        print("   自動再実行ワークフローにより続きから再開されます。")
+        print(f"⏸️ 今回の実行をチェックポイント保存しました (進捗: {scraped_count}/{len(all_race_ids)} 件)。")
+        print(f"   次回ジョブ (第 {args.iteration + 1} 世代) により自動で続きから再開されます。")
         print("=" * 70)
         return
 
