@@ -54,22 +54,62 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Restore existing DB from data branch
+      - name: Restore existing DB from data branch or latest artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "=== 既存データの復元 ==="
+          RESTORED=false
+
+          # 1. リモートの data ブランチから検索
           if git ls-remote --heads origin data | grep -q 'refs/heads/data'; then
-            echo "リモートの data ブランチから前回のデータベース (pakapaka.db) を復元します..."
-            git fetch origin data:data
-            git checkout data -- pakapaka.db 2>/dev/null || git checkout data -- backend/pakapaka.db 2>/dev/null || true
-            git reset HEAD pakapaka.db 2>/dev/null || true
-            if [ -f backend/pakapaka.db ] && [ ! -f pakapaka.db ]; then
-              cp backend/pakapaka.db pakapaka.db
+            echo "リモートの data ブランチを確認中..."
+            git fetch origin data:data || true
+            
+            # pakapaka.db.gz が存在する場合
+            if git ls-tree -r data --name-only | grep -q 'pakapaka.db.gz'; then
+              echo "data ブランチから pakapaka.db.gz を復元・解凍中..."
+              git checkout data -- pakapaka.db.gz
+              git reset HEAD pakapaka.db.gz 2>/dev/null || true
+              gzip -d -c pakapaka.db.gz > pakapaka.db
+              rm -f pakapaka.db.gz
+              RESTORED=true
+            # 非圧縮 pakapaka.db が存在する場合
+            elif git ls-tree -r data --name-only | grep -q 'pakapaka.db'; then
+              echo "data ブランチから pakapaka.db を復元中..."
+              git checkout data -- pakapaka.db 2>/dev/null || git checkout data -- backend/pakapaka.db 2>/dev/null || true
+              git reset HEAD pakapaka.db 2>/dev/null || true
+              RESTORED=true
             fi
-            if [ -f pakapaka.db ]; then
-              echo "✓ 前回のデータベースを正常に復元しました (サイズ: $(ls -lh pakapaka.db | awk '{print $5}'))"
-            fi
+          fi
+
+          # 2. data ブランチから取得できなかった場合の Artifact フォールバック復元
+          if [ "$RESTORED" != "true" ] || [ ! -f pakapaka.db ]; then
+            echo "data ブランチにデータが見つからないため、直近の Artifact からバックアップを検索します..."
+            LATEST_RUNS=$(gh run list --workflow=scrape_auto_resume.yml --limit 10 --json databaseId --jq '.[].databaseId')
+            for RUN_ID in $LATEST_RUNS; do
+              echo "Run $RUN_ID の Artifact を確認中..."
+              mkdir -p /tmp/artifact_restore
+              if gh run download "$RUN_ID" --pattern "pakapaka-db-*" -D /tmp/artifact_restore 2>/dev/null; then
+                DB_RESTORED=$(find /tmp/artifact_restore -name "pakapaka.db" | head -n 1)
+                if [ -n "$DB_RESTORED" ] && [ -f "$DB_RESTORED" ]; then
+                  cp "$DB_RESTORED" pakapaka.db
+                  echo "✓ Run $RUN_ID の Artifact からデータベースを復元しました！"
+                  RESTORED=true
+                  break
+                fi
+              fi
+            done
+          fi
+
+          if [ -f backend/pakapaka.db ] && [ ! -f pakapaka.db ]; then
+            cp backend/pakapaka.db pakapaka.db
+          fi
+
+          if [ -f pakapaka.db ]; then
+            echo "✓ データベースの復元完了 (サイズ: $(ls -lh pakapaka.db | awk '{print $5}'))"
           else
-            echo "data ブランチが存在しないため、新規データベースで開始します。"
+            echo "復元可能なデータが見つからないため、新規データベースで開始します。"
           fi
 
       - name: Set up Python
@@ -114,8 +154,10 @@ jobs:
           fi
 
           if [ -n "$DB_FILE" ]; then
-            # 1. 安全のため /tmp に二重バックアップ
-            cp "$DB_FILE" /tmp/pakapaka_backup.db
+            echo "データベースを gzip 圧縮中 (GitHub 100MB制限対策)..."
+            gzip -9 -c "$DB_FILE" > /tmp/pakapaka.db.gz
+            echo "✓ 圧縮完了: $(ls -lh "$DB_FILE" | awk '{print $5}') -> $(ls -lh /tmp/pakapaka.db.gz | awk '{print $5}')"
+
             if [ -d data/models ]; then
               cp -r data/models /tmp/models_backup
             fi
@@ -126,14 +168,14 @@ jobs:
             git config --global user.name "github-actions[bot]"
             git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-            # 2. 孤立ブランチ (orphan) を作成
+            # 孤立ブランチ (orphan) を作成
             git checkout --orphan data-temp
-            # 3. インデックスのみを初期化 (作業ディレクトリの実ファイルは絶対に消さない)
+            # インデックスのみ初期化 (実ファイルは絶対に消さない)
             git rm --cached -r . > /dev/null 2>&1 || true
 
-            # 4. 退避したDBを確実に配置してコミット
-            cp /tmp/pakapaka_backup.db pakapaka.db
-            git add -f pakapaka.db
+            # 圧縮済みDBを配置
+            cp /tmp/pakapaka.db.gz pakapaka.db.gz
+            git add -f pakapaka.db.gz
 
             if [ -d /tmp/models_backup ]; then
               mkdir -p data/models
@@ -151,7 +193,7 @@ jobs:
             git branch -D data > /dev/null 2>&1 || true
             git branch -m data
             git push origin data --force
-            echo "✓ data ブランチへ最新データを force push しました。"
+            echo "✓ data ブランチへ圧縮済み最新データ (pakapaka.db.gz) を force push しました。"
           else
             echo "保存対象の pakapaka.db が見つかりませんでした。"
           fi
