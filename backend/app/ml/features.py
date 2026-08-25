@@ -2,42 +2,12 @@
 Feature engineering pipeline with strict leak-prevention design for horse racing predictions.
 """
 
-from typing import List, Tuple, Optional, Set
+from typing import List, Tuple, Set
 import numpy as np
 import pandas as pd
 
+from app.ml.history import HISTORY_FEATURES
 
-# Reference sets for top performers in Japanese horse racing
-DEFAULT_TOP_JOCKEYS: Set[str] = {
-    "ルメール",
-    "川田将雅",
-    "武豊",
-    "坂井瑠星",
-    "戸崎圭太",
-    "松山弘平",
-    "横山武史",
-    "モレイラ",
-    "レーン",
-    "デムーロ",
-    "岩田望来",
-    "鮫島克駿",
-    "西村淳也",
-}
-
-DEFAULT_TOP_TRAINERS: Set[str] = {
-    "矢作芳人",
-    "中内田充",
-    "手塚貴久",
-    "木村哲也",
-    "友道康夫",
-    "国枝栄",
-    "杉山晴紀",
-    "池江泰寿",
-    "堀宣行",
-    "宮田敬介",
-    "斉藤崇史",
-    "藤原英昭",
-}
 
 SEX_MAP = {"牡": 0, "牝": 1, "セ": 2}
 SURFACE_MAP = {"芝": 0, "ダート": 1, "障害": 2, "障": 2}
@@ -71,14 +41,6 @@ class FeatureExtractor:
     Extracts and transforms tabular horse racing features from raw entry & race data.
     Guarantees strict isolation of post-race outcome labels from feature vectors.
     """
-
-    def __init__(
-        self,
-        top_jockeys: Optional[Set[str]] = None,
-        top_trainers: Optional[Set[str]] = None,
-    ):
-        self.top_jockeys = top_jockeys if top_jockeys is not None else DEFAULT_TOP_JOCKEYS
-        self.top_trainers = top_trainers if top_trainers is not None else DEFAULT_TOP_TRAINERS
 
     def extract_features(
         self,
@@ -145,12 +107,6 @@ class FeatureExtractor:
         track_cond_raw = df.get("track_condition", "良").fillna("良").astype(str)
         df["track_condition_code"] = track_cond_raw.map(lambda tc: TRACK_CONDITION_MAP.get(tc, 0)).astype(int)
 
-        # 3. Jockey & Trainer Features
-        jockey_series = df.get("jockey_name", "").fillna("").astype(str)
-        trainer_series = df.get("trainer_name", "").fillna("").astype(str)
-        df["is_top_jockey"] = jockey_series.isin(self.top_jockeys).astype(int)
-        df["is_top_trainer"] = trainer_series.isin(self.top_trainers).astype(int)
-
         # 4. Market Odds & Popularity Features
         raw_odds = pd.to_numeric(df.get("odds", 10.0), errors="coerce").fillna(10.0)
         safe_odds = raw_odds.apply(lambda x: float(x) if float(x) >= 1.0 else 1.0)
@@ -172,12 +128,13 @@ class FeatureExtractor:
             "distance",
             "surface_code",
             "track_condition_code",
-            "is_top_jockey",
-            "is_top_trainer",
             "odds",
             "log_odds",
             "popularity",
         ]
+
+        # As-of history features, when the caller has attached them (see app.ml.history).
+        feature_cols += [c for c in HISTORY_FEATURES if c in df.columns]
 
         # 5. Target generation when training
         if is_training and "finish_position" in df.columns:

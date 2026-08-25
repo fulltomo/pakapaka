@@ -6,10 +6,12 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict, Any
 import numpy as np
 import pandas as pd
-from sqlalchemy.orm import Session
+from sqlalchemy import select, or_, and_
+from sqlalchemy.orm import Session, object_session
 
-from app.models.schema import Race, Prediction
+from app.models.schema import Race, RaceEntry, Prediction
 from app.ml.features import FeatureExtractor
+from app.ml.history import add_history_features
 from app.ml.model import HorseRacingModel
 
 
@@ -54,6 +56,51 @@ class Predictor:
         self.model = model
         self.feature_extractor = feature_extractor or FeatureExtractor()
 
+    # Two years covers more prior rides than the jockey/trainer rolling windows use.
+    HISTORY_LOOKBACK_DAYS = 730
+
+    def _load_history(self, race: Race, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Loads the finished races before `race` that this race's horses, jockeys and
+        trainers need. Returns an empty frame when the race is not bound to a session.
+        """
+        db = object_session(race)
+        if db is None:
+            return pd.DataFrame()
+
+        cutoff = (
+            pd.Timestamp(race.date) - pd.Timedelta(days=self.HISTORY_LOOKBACK_DAYS)
+        ).strftime("%Y-%m-%d")
+
+        stmt = (
+            select(
+                Race.id.label("race_id"),
+                Race.date.label("race_date"),
+                RaceEntry.horse_id,
+                RaceEntry.jockey_name,
+                RaceEntry.trainer_name,
+                RaceEntry.finish_position,
+                RaceEntry.odds,
+            )
+            .join(RaceEntry, RaceEntry.race_id == Race.id)
+            .where(
+                Race.date < race.date,
+                Race.status == "finished",
+                RaceEntry.finish_position.isnot(None),
+                or_(
+                    RaceEntry.horse_id.in_(df["horse_id"].tolist()),
+                    and_(
+                        Race.date >= cutoff,
+                        or_(
+                            RaceEntry.jockey_name.in_(df["jockey_name"].tolist()),
+                            RaceEntry.trainer_name.in_(df["trainer_name"].tolist()),
+                        ),
+                    ),
+                ),
+            )
+        )
+        return pd.read_sql(stmt, db.connection())
+
     def predict_race(self, race: Race) -> List[PredictionResult]:
         """
         Generates calibrated win/place predictions, EV, and recommendation marks for all entries in a race.
@@ -76,6 +123,8 @@ class Predictor:
         for entry in race.entries:
             records.append({
                 "race_id": race.id,
+                "race_date": race.date,
+                "finish_position": np.nan,
                 "horse_id": entry.horse_id,
                 "horse_name": entry.horse_name,
                 "post_position": entry.post_position,
@@ -95,6 +144,15 @@ class Predictor:
             })
 
         df = pd.DataFrame(records)
+        df["_order"] = range(len(df))
+
+        # Attach the same as-of history the model was trained on. Prior races come
+        # from the DB; add_history_features is shared with training so the two
+        # cannot drift apart.
+        history = self._load_history(race, df)
+        combined = pd.concat([history, df], ignore_index=True) if not history.empty else df
+        combined, _ = add_history_features(combined)
+        df = combined[combined["race_id"] == race.id].sort_values("_order")
 
         # Feature extraction
         features_df, feature_cols = self.feature_extractor.extract_features(

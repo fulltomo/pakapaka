@@ -30,7 +30,7 @@ def test_model_training_and_prediction(db_session):
     generator.generate_races(db_session, count=30)
 
     trainer = ModelTrainer(random_state=42)
-    model, metrics = trainer.train(db_session)
+    model, metrics = trainer.train(db_session, save_model=False)
 
     assert model is not None
     assert "roc_auc" in metrics
@@ -124,7 +124,7 @@ def test_trainer_evaluation_metrics(db_session):
     generator.generate_races(db_session, count=25)
 
     trainer = ModelTrainer(test_size=0.2, random_state=42)
-    model, metrics = trainer.train(db_session)
+    model, metrics = trainer.train(db_session, save_model=False)
 
     assert "roc_auc" in metrics
     assert "log_loss" in metrics
@@ -144,8 +144,8 @@ def test_trainer_evaluation_metrics(db_session):
 def test_trainer_empty_db_raises_error(db_session):
     """Test trainer raises ValueError if no finished races exist."""
     trainer = ModelTrainer()
-    with pytest.raises(ValueError, match="No finished races"):
-        trainer.train(db_session)
+    with pytest.raises(ValueError, match="No valid finished race entries"):
+        trainer.train(db_session, save_model=False)
 
 
 def test_predictor_race_normalization_and_ev(db_session):
@@ -154,7 +154,7 @@ def test_predictor_race_normalization_and_ev(db_session):
     generator.generate_races(db_session, count=20)
 
     trainer = ModelTrainer(random_state=42)
-    model, _ = trainer.train(db_session)
+    model, _ = trainer.train(db_session, save_model=False)
 
     predictor = Predictor(model)
     target_race = db_session.query(Race).first()
@@ -181,7 +181,7 @@ def test_predictor_save_predictions_to_db(db_session):
     generator.generate_races(db_session, count=15)
 
     trainer = ModelTrainer(random_state=42)
-    model, _ = trainer.train(db_session)
+    model, _ = trainer.train(db_session, save_model=False)
 
     predictor = Predictor(model)
     target_race = db_session.query(Race).first()

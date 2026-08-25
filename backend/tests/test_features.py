@@ -128,8 +128,6 @@ def test_feature_extraction_basic():
 
     assert "weight_ratio" in feature_cols
     assert "sex_code" in feature_cols
-    assert "is_top_jockey" in feature_cols
-    assert "is_top_trainer" in feature_cols
     assert "finish_position" not in feature_cols  # Leak prevention
     assert len(features_df) == 2
 
@@ -153,22 +151,6 @@ def test_categorical_encodings(sample_race_df):
     # horse_age
     assert features_df.loc[0, "horse_age"] == 4
     assert features_df.loc[1, "horse_age"] == 3
-
-
-def test_top_jockey_and_trainer(sample_race_df):
-    """Test top jockey and trainer binary flags."""
-    extractor = FeatureExtractor()
-    features_df, feature_cols = extractor.extract_features(sample_race_df, is_training=False)
-
-    # ルメール & 川田将雅 should be 1, 一般騎手 should be 0
-    assert features_df.loc[0, "is_top_jockey"] == 1
-    assert features_df.loc[1, "is_top_jockey"] == 1
-    assert features_df.loc[2, "is_top_jockey"] == 0
-
-    # 木村哲也 & 中内田充 should be 1, 一般調教師 should be 0
-    assert features_df.loc[0, "is_top_trainer"] == 1
-    assert features_df.loc[1, "is_top_trainer"] == 1
-    assert features_df.loc[2, "is_top_trainer"] == 0
 
 
 def test_weight_ratio_calculation(sample_race_df):
