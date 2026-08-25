@@ -18,6 +18,12 @@ class Race(Base):
     track_condition = Column(String(8), nullable=False, default="良")  # "良", "稍重", "重", "不良"
     weather = Column(String(8), nullable=False, default="晴")  # "晴", "曇", "雨", "小雨"
     status = Column(String(16), nullable=False, default="scheduled", index=True)  # "scheduled", "finished", "cancelled"
+    race_class = Column(String(32), nullable=True)      # "新馬", "未勝利", "1勝クラス", "オープン", "G1" ...
+    race_condition = Column(String(32), nullable=True)  # "[指](定量)" — 出走条件と重量規定
+    post_time = Column(String(8), nullable=True)        # 発走時刻 "17:50"
+    lap_times = Column(String(256), nullable=True)      # 200mごとのラップ "12.2-10.9-11.1"
+    pace = Column(String(64), nullable=True)            # 前半/後半3F "34.2-35.1"
+    parser_version = Column(Integer, nullable=True)     # which scraper build wrote this row
 
     # Relationships
     entries = relationship(
@@ -65,6 +71,10 @@ class RaceEntry(Base):
     finish_position = Column(Integer, nullable=True)  # 着順 (1..18)
     finish_time = Column(String(16), nullable=True)  # 走破タイム (e.g., "2:24.5")
     margin = Column(String(16), nullable=True)  # 着差 (e.g., "クビ", "1 1/2")
+    final_600m = Column(Float, nullable=True)          # 上がり3ハロン (e.g., 33.4)
+    corner_positions = Column(String(32), nullable=True)  # 通過順位 "4-5-5-3"
+    prize_money = Column(Float, nullable=True)         # 獲得賞金 (万円)
+    owner_name = Column(String(64), nullable=True)     # 馬主
 
     # Relationships
     race = relationship("Race", back_populates="entries")
@@ -148,3 +158,24 @@ class WalletSession(Base):
         cascade="all, delete-orphan",
         order_by="SimulatedBet.created_at.desc()",
     )
+
+
+class Horse(Base):
+    """Per-horse profile from db.netkeiba.com/horse/{id}. One row per horse, scraped once."""
+
+    __tablename__ = "horses"
+
+    horse_id = Column(String(32), primary_key=True, index=True)
+    horse_name = Column(String(64), nullable=True)
+    birth_date = Column(String(16), nullable=True)      # "2023-02-28"
+    sire = Column(String(64), nullable=True, index=True)          # 父
+    sire_sire = Column(String(64), nullable=True)                 # 父父 (サイアーライン)
+    dam = Column(String(64), nullable=True)                       # 母
+    broodmare_sire = Column(String(64), nullable=True, index=True) # 母父
+    breeder = Column(String(64), nullable=True, index=True)        # 生産者
+    origin = Column(String(32), nullable=True)                     # 産地
+    auction_price = Column(Float, nullable=True)       # セリ取引価格 (万円). None when not sold at auction.
+    trainer_name = Column(String(32), nullable=True)
+    stable = Column(String(8), nullable=True)          # "栗東" / "美浦"
+    owner_name = Column(String(64), nullable=True)
+    scraped_at = Column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
