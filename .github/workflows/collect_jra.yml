@@ -1,0 +1,175 @@
+name: Collect JRA Races & Horse Profiles
+
+# Two-phase collection, both resumable:
+#   races  — re-fetch JRA result pages with the current parser (上がり3F, 通過順位,
+#            ラップ, 天候, 馬場, クラス, 賞金, 馬主)
+#   horses — one profile + pedigree row per horse seen in those races
+# Each run stops before the 6h runner limit, pushes the DB to the data branch and
+# re-triggers itself while work remains.
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: "収集フェーズ"
+        required: true
+        default: "races"
+        type: choice
+        options: [races, horses]
+      start_year:
+        description: "開始年"
+        required: true
+        default: "2021"
+        type: string
+      end_year:
+        description: "終了年"
+        required: true
+        default: "2026"
+        type: string
+      time_limit_minutes:
+        description: "1回の最大実行時間(分)"
+        required: true
+        default: "320"
+        type: string
+      min_delay:
+        description: "最小リクエスト間隔(秒)"
+        required: true
+        default: "1.2"
+        type: string
+      max_delay:
+        description: "最大リクエスト間隔(秒)"
+        required: true
+        default: "2.2"
+        type: string
+      iteration:
+        description: "現在のループ回数"
+        required: false
+        default: "1"
+        type: string
+      max_iterations:
+        description: "最大自動再実行回数"
+        required: false
+        default: "12"
+        type: string
+      skip_pedigree:
+        description: "horses: 血統ページを取らない (リクエスト半減)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  # Both phases write the same data branch, so never let two runs overlap.
+  group: collect-jra
+  cancel-in-progress: false
+
+env:
+  DATABASE_URL: sqlite:///./pakapaka.db
+  MODEL_DIR: data/models
+  CACHE_DIR: data/cache
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore DB from data branch
+        run: |
+          if git ls-remote --exit-code --heads origin data >/dev/null 2>&1; then
+            git fetch origin data:data
+            if git ls-tree -r data --name-only | grep -qx 'pakapaka.db.gz'; then
+              git show data:pakapaka.db.gz | gzip -dc > pakapaka.db
+              echo "✓ 復元: $(du -h pakapaka.db | cut -f1)"
+            fi
+          fi
+          if [ ! -f pakapaka.db ]; then
+            echo "既存DBなし。新規作成で開始します。"
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      - name: Collect
+        id: collect
+        run: |
+          mkdir -p data/models data/cache
+          if [ "${{ inputs.phase }}" = "races" ]; then
+            python backend/scripts/scrape_real_data.py \
+              --jra-only --refresh --skip-train \
+              --start-year "${{ inputs.start_year }}" \
+              --end-year "${{ inputs.end_year }}" \
+              --max-races 0 \
+              --min-delay "${{ inputs.min_delay }}" \
+              --max-delay "${{ inputs.max_delay }}" \
+              --time-limit-minutes "${{ inputs.time_limit_minutes }}" \
+              --iteration "${{ inputs.iteration }}" \
+              --max-iterations "${{ inputs.max_iterations }}"
+          else
+            python backend/scripts/scrape_horses.py \
+              --jra-only \
+              --min-delay "${{ inputs.min_delay }}" \
+              --max-delay "${{ inputs.max_delay }}" \
+              --time-limit-minutes "${{ inputs.time_limit_minutes }}" \
+              ${{ inputs.skip_pedigree && '--skip-pedigree' || '' }}
+          fi
+
+      - name: Checkpoint DB to data branch
+        if: always()
+        run: |
+          [ -f pakapaka.db ] || { echo "保存対象なし"; exit 0; }
+          gzip -9 -c pakapaka.db > /tmp/pakapaka.db.gz
+          echo "圧縮: $(du -h pakapaka.db | cut -f1) -> $(du -h /tmp/pakapaka.db.gz | cut -f1)"
+
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan data-temp
+          git rm --cached -r . >/dev/null 2>&1 || true
+          cp /tmp/pakapaka.db.gz pakapaka.db.gz
+          git add -f pakapaka.db.gz
+          git commit -m "Collect ${{ inputs.phase }} gen ${{ inputs.iteration }}: +${{ steps.collect.outputs.scraped_count || '0' }} [skip ci]"
+          git branch -D data >/dev/null 2>&1 || true
+          git branch -m data
+          git push origin data --force
+          echo "✓ data ブランチへ push しました。"
+
+      - name: Upload DB artifact (backup)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pakapaka-db-${{ inputs.phase }}-gen-${{ inputs.iteration }}
+          path: pakapaka.db
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Re-trigger while work remains
+        if: steps.collect.outputs.has_more == 'true' && fromJSON(inputs.iteration) < fromJSON(inputs.max_iterations)
+        env:
+          # GITHUB_TOKEN cannot start another workflow run; a PAT is required for the chain.
+          GH_TOKEN: ${{ secrets.AUTO_RESUME_TOKEN || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          NEXT=$(( ${{ inputs.iteration }} + 1 ))
+          echo "残作業あり。第 ${NEXT} 世代を起動します。"
+          gh workflow run collect_jra.yml \
+            -f phase="${{ inputs.phase }}" \
+            -f start_year="${{ inputs.start_year }}" \
+            -f end_year="${{ inputs.end_year }}" \
+            -f time_limit_minutes="${{ inputs.time_limit_minutes }}" \
+            -f min_delay="${{ inputs.min_delay }}" \
+            -f max_delay="${{ inputs.max_delay }}" \
+            -f iteration="${NEXT}" \
+            -f max_iterations="${{ inputs.max_iterations }}" \
+            -f skip_pedigree="${{ inputs.skip_pedigree }}"

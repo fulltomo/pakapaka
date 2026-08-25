@@ -8,11 +8,13 @@ from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, List
 import numpy as np
 import pandas as pd
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 from sklearn.metrics import roc_auc_score, log_loss, brier_score_loss
 
-from app.models.schema import Race
+from app.models.schema import Race, RaceEntry
 from app.ml.features import FeatureExtractor
+from app.ml.history import add_history_features
 from app.ml.model import HorseRacingModel
 
 
@@ -30,6 +32,7 @@ class ModelTrainer:
         model_dir: str = "data/models",
         model_version: Optional[str] = None,
         calibration_method: str = "sigmoid",
+        race_courses: Optional[List[str]] = None,
     ):
         self.feature_extractor = feature_extractor or FeatureExtractor()
         self.test_size = test_size
@@ -37,55 +40,51 @@ class ModelTrainer:
         self.model_dir = model_dir
         self.model_version = model_version or f"v_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
         self.calibration_method = calibration_method
+        # Restrict training to these racecourses; None trains on everything.
+        self.race_courses = race_courses
 
     def _extract_dataset_from_db(self, db: Session) -> pd.DataFrame:
         """
-        Queries finished races and their entries, joining race attributes for feature extraction.
+        Loads finished races joined with their entries as a single flat DataFrame.
         """
-        races = (
-            db.query(Race)
-            .filter(Race.status == "finished")
+        stmt = (
+            select(
+                Race.id.label("race_id"),
+                Race.date.label("race_date"),
+                Race.race_course,
+                Race.race_number,
+                RaceEntry.horse_id,
+                RaceEntry.horse_name,
+                RaceEntry.post_position,
+                RaceEntry.horse_number,
+                RaceEntry.handicap_weight,
+                RaceEntry.horse_weight,
+                RaceEntry.horse_weight_diff,
+                RaceEntry.sex,
+                RaceEntry.age,
+                Race.distance,
+                Race.surface,
+                Race.track_condition,
+                RaceEntry.odds,
+                RaceEntry.popularity,
+                RaceEntry.jockey_name,
+                RaceEntry.trainer_name,
+                RaceEntry.finish_position,
+                RaceEntry.finish_time,
+                RaceEntry.margin,
+            )
+            .join(RaceEntry, RaceEntry.race_id == Race.id)
+            .where(Race.status == "finished", RaceEntry.finish_position.isnot(None))
             .order_by(Race.date.asc(), Race.id.asc())
-            .all()
         )
 
-        if not races:
-            raise ValueError("No finished races found in database for model training.")
+        if self.race_courses:
+            stmt = stmt.where(Race.race_course.in_(self.race_courses))
 
-        records = []
-        for race in races:
-            for entry in race.entries:
-                if entry.finish_position is not None:
-                    records.append({
-                        "race_id": race.id,
-                        "race_date": race.date,
-                        "race_course": race.race_course,
-                        "race_number": race.race_number,
-                        "horse_id": entry.horse_id,
-                        "horse_name": entry.horse_name,
-                        "post_position": entry.post_position,
-                        "horse_number": entry.horse_number,
-                        "handicap_weight": entry.handicap_weight,
-                        "horse_weight": entry.horse_weight,
-                        "horse_weight_diff": entry.horse_weight_diff,
-                        "sex": entry.sex,
-                        "age": entry.age,
-                        "distance": race.distance,
-                        "surface": race.surface,
-                        "track_condition": race.track_condition,
-                        "odds": entry.odds,
-                        "popularity": entry.popularity,
-                        "jockey_name": entry.jockey_name,
-                        "trainer_name": entry.trainer_name,
-                        "finish_position": entry.finish_position,
-                        "finish_time": entry.finish_time,
-                        "margin": entry.margin,
-                    })
-
-        if not records:
+        df = pd.read_sql(stmt, db.connection())
+        if df.empty:
             raise ValueError("No valid finished race entries found with finish positions.")
-
-        return pd.DataFrame(records)
+        return df
 
     def _safe_roc_auc(self, y_true: np.ndarray, y_pred: np.ndarray) -> float:
         """Computes ROC-AUC safely handling single-class edge cases."""
@@ -136,6 +135,7 @@ class ModelTrainer:
         """
         eff_test_size = test_size if test_size is not None else self.test_size
         raw_df = self._extract_dataset_from_db(db)
+        raw_df, _ = add_history_features(raw_df)
 
         # Feature extraction with training targets
         features_df, feature_cols = self.feature_extractor.extract_features(

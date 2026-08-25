@@ -14,6 +14,10 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Set
 
+# Windows consoles default to cp932, which cannot encode the progress output.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 # Ensure backend root is on sys.path
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
@@ -26,7 +30,8 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import SessionLocal, init_db, engine
 from app.models.schema import Base, Race, RaceEntry, Payout, SimulatedBet, WalletSession
-from app.data.scraper import NetkeibaScraper
+from app.data.scraper import NetkeibaScraper, PARSER_VERSION
+from app.data.venues import is_jra
 from app.data.cache import HTMLCache
 from app.ml.trainer import ModelTrainer
 from app.ml.predictor import Predictor
@@ -100,6 +105,8 @@ def main():
     parser.add_argument("--max-iterations", type=int, default=10, help="Max allowed iterations to prevent infinite loops")
     parser.add_argument("--clear-db", action="store_true", help="Clear existing database tables before import")
     parser.add_argument("--skip-train", action="store_true", help="Explicitly skip training LightGBM model and backtest")
+    parser.add_argument("--jra-only", action="store_true", help="Keep only JRA (central) races; drops NAR and ban'ei")
+    parser.add_argument("--refresh", action="store_true", help="Re-fetch races stored by an older parser build")
     args = parser.parse_args()
 
     start_time = time.time()
@@ -133,7 +140,9 @@ def main():
     with httpx.Client(timeout=10.0) as client:
         for d in target_dates:
             rids = discover_race_ids_for_date(d, client)
-            # Collect 100% of all races (1R through 12R) without filtering
+            # The netkeiba day listing mixes JRA, NAR and ban'ei races.
+            if args.jra_only:
+                rids = [r for r in rids if is_jra(r)]
             all_race_ids.extend(rids)
             if args.max_races > 0 and len(all_race_ids) >= args.max_races:
                 break
@@ -166,7 +175,10 @@ def main():
         try:
             # Check if race already in DB
             existing = db.query(Race).filter_by(id=race_id).first()
-            if existing and len(existing.entries) > 0:
+            up_to_date = existing is not None and existing.entries and (
+                not args.refresh or existing.parser_version == PARSER_VERSION
+            )
+            if up_to_date:
                 scraped_count += 1
                 total_entries += len(existing.entries)
                 total_payouts += len(existing.payouts)
@@ -240,7 +252,7 @@ def main():
     print(f"    - 複勝 ROC-AUC: {metrics.get('place_roc_auc', 0):.4f}")
 
     # Top 5 Features
-    top_features = sorted(metrics.get("feature_importances", {}).items(), key=lambda x: x[1], reverse=True)[:5]
+    top_features = sorted(metrics.get("feature_importance", {}).items(), key=lambda x: x[1], reverse=True)[:5]
     print("    - 重要特徴量 Top 5:")
     for feat, imp in top_features:
         print(f"      • {feat}: {imp:.1f}")

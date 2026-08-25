@@ -1,12 +1,27 @@
 import re
 import time
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 import httpx
 from bs4 import BeautifulSoup
 from sqlalchemy.orm import Session
 
-from app.models.schema import Race, RaceEntry, Payout
+from app.models.schema import Race, RaceEntry, Payout, Horse
 from app.data.cache import HTMLCache
+from app.data.venues import decode_race_id, UNKNOWN_COURSE
+
+
+# Bumped whenever the parser starts extracting fields older rows do not have, so a
+# refresh pass can tell which races still need re-fetching.
+PARSER_VERSION = 2
+
+
+def _to_float(text: str):
+    """Parses a numeric cell, tolerating thousands separators and blanks."""
+    try:
+        return float(str(text).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
 
 
 class NetkeibaScraper:
@@ -15,6 +30,8 @@ class NetkeibaScraper:
     """
 
     BASE_DB_URL = "https://db.netkeiba.com/race/{race_id}/"
+    HORSE_URL = "https://db.netkeiba.com/horse/{horse_id}/"
+    PEDIGREE_URL = "https://db.netkeiba.com/horse/ped/{horse_id}/"
     DEFAULT_HEADERS = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -42,12 +59,25 @@ class NetkeibaScraper:
         self._last_request_time: float = 0.0
 
     def fetch_race_html(self, race_id: str, use_cache: bool = True) -> Optional[str]:
+        """Fetches the result page for a race ID."""
+        return self._fetch(self.BASE_DB_URL.format(race_id=race_id), race_id, use_cache)
+
+    def fetch_horse_html(self, horse_id: str, use_cache: bool = True) -> Optional[str]:
+        """Fetches the profile page for a horse ID."""
+        return self._fetch(self.HORSE_URL.format(horse_id=horse_id), f"horse_{horse_id}", use_cache)
+
+    def fetch_pedigree_html(self, horse_id: str, use_cache: bool = True) -> Optional[str]:
+        """Fetches the pedigree page for a horse ID (the profile page renders its pedigree in JS)."""
+        return self._fetch(self.PEDIGREE_URL.format(horse_id=horse_id), f"ped_{horse_id}", use_cache)
+
+    def _fetch(self, url: str, cache_key: str, use_cache: bool = True) -> Optional[str]:
         """
-        Fetches HTML for a given race ID with random jitter delay, local cache, and retry on rate-limiting.
+        Polite fetch shared by every page type: jitter delay, local cache, retry with
+        backoff on rate limiting.
         """
         import random
-        if use_cache and self.cache.has(race_id):
-            return self.cache.get(race_id)
+        if use_cache and self.cache.has(cache_key):
+            return self.cache.get(cache_key)
 
         # Rate limiting check with random jitter
         target_delay = random.uniform(self.min_delay, self.max_delay) if self.max_delay > self.min_delay else self.rate_limit_delay
@@ -55,8 +85,6 @@ class NetkeibaScraper:
         if elapsed < target_delay:
             time.sleep(target_delay - elapsed)
 
-        url = self.BASE_DB_URL.format(race_id=race_id)
-        
         for attempt in range(1, self.max_retries + 1):
             try:
                 with httpx.Client(timeout=self.timeout, headers=self.DEFAULT_HEADERS) as client:
@@ -76,7 +104,7 @@ class NetkeibaScraper:
                     # netkeiba uses euc-jp encoding
                     content = response.content.decode("euc-jp", errors="replace")
                     if use_cache:
-                        self.cache.set(race_id, content)
+                        self.cache.set(cache_key, content)
                     return content
             except Exception as e:
                 if attempt == self.max_retries:
@@ -97,18 +125,24 @@ class NetkeibaScraper:
             if rname_elem:
                 race_name = rname_elem.get_text(strip=True)
 
-        # Race Course & Number
-        race_course = "東京"
-        race_number = 11
+        # Race Course & Number.
+        # The race_id is authoritative (it encodes both); the page is only a fallback,
+        # since its course regex covers JRA venues alone and silently defaulted
+        # every NAR/ban'ei race to 東京 / 11R.
+        race_course, race_number = decode_race_id(race_id)
         rdata02 = soup.find(class_="RaceData02") or (intro.find(class_="smalltxt") if intro else None)
-        if rdata02:
+        if rdata02 and (race_course is None or race_number is None):
             rdata02_text = rdata02.get_text()
-            course_match = re.search(r"(東京|中山|京都|阪神|新潟|中京|小倉|札幌|函館|福島)", rdata02_text)
-            if course_match:
-                race_course = course_match.group(1)
-            num_match = re.search(r"(\d+)R", rdata02_text)
-            if num_match:
-                race_number = int(num_match.group(1))
+            if race_course is None:
+                course_match = re.search(r"(東京|中山|京都|阪神|新潟|中京|小倉|札幌|函館|福島)", rdata02_text)
+                if course_match:
+                    race_course = course_match.group(1)
+            if race_number is None:
+                num_match = re.search(r"(\d+)R", rdata02_text)
+                if num_match:
+                    race_number = int(num_match.group(1))
+        race_course = race_course or UNKNOWN_COURSE
+        race_number = race_number or 0
 
         # Surface, Distance, Weather, Track Condition
         surface = "芝"
@@ -128,17 +162,14 @@ class NetkeibaScraper:
             if dist_match:
                 distance = int(dist_match.group(1))
 
-            weather_match = re.search(r"天候:?([^\s/]+)", txt)
-            if weather_match:
-                weather = weather_match.group(1).strip(" :")
+            weather, track_condition = self._parse_going(txt, weather, track_condition)
 
-            cond_match = re.search(r"馬場:?([^\s/]+)", txt)
-            if cond_match:
-                track_condition = cond_match.group(1).strip(" :")
-            else:
-                cond_match2 = re.search(r"(?:芝|ダート|ダ):?\s*(良|稍重|重|不良)", txt)
-                if cond_match2:
-                    track_condition = cond_match2.group(1).strip()
+        intro_txt = intro.get_text(" ", strip=True).replace(" ", " ") if intro else ""
+        if intro_txt:
+            weather, track_condition = self._parse_going(intro_txt, weather, track_condition)
+
+        race_class, race_condition, post_time = self._parse_class(intro_txt)
+        lap_times, pace = self._parse_lap(soup)
 
         # Date
         date_str = "2024-01-01"
@@ -157,8 +188,59 @@ class NetkeibaScraper:
             "surface": surface,
             "track_condition": track_condition,
             "weather": weather,
+            "race_class": race_class,
+            "race_condition": race_condition,
+            "post_time": post_time,
+            "lap_times": lap_times,
+            "pace": pace,
             "status": "finished",
         }
+
+    # netkeiba writes these as "天候 : 晴" / "芝 : 良" — spaces around the colon are
+    # what made the previous patterns miss and fall back to the defaults.
+    WEATHER_VALUES = ("晴", "曇", "小雨", "雨", "小雪", "雪")
+    GOING_VALUES = ("良", "稍重", "重", "不良")
+
+    def _parse_going(self, txt: str, weather: str, track_condition: str):
+        """Extracts weather and going, keeping the current values when absent."""
+        w = re.search(r"天候\s*[:：]\s*(" + "|".join(self.WEATHER_VALUES) + ")", txt)
+        if w:
+            weather = w.group(1)
+        c = re.search(r"(?:馬場|芝|ダート|ダ)\s*[:：]\s*(" + "|".join(self.GOING_VALUES) + ")", txt)
+        if c:
+            track_condition = c.group(1)
+        return weather, track_condition
+
+    def _parse_class(self, intro_txt: str):
+        """
+        Pulls race class, entry condition and post time out of the data_intro header, e.g.
+        "... 発走 : 17:50 2026年08月23日 3回中京2日目 3歳以上1勝クラス  [指](定量)"
+        """
+        if not intro_txt:
+            return None, None, None
+
+        post = re.search(r"発走\s*[:：]\s*(\d{1,2}:\d{2})", intro_txt)
+        post_time = post.group(1) if post else None
+
+        # The class name sits between the meeting ("3回中京2日目") and the bracketed condition.
+        cls = re.search(r"\d+回\S+?\d+日目\s*(.*?)\s*(?=[\[(]|$)", intro_txt)
+        race_class = (cls.group(1).strip() or None) if cls else None
+
+        cond = re.search(r"((?:\[[^\]]*\]|\([^)]*\))+)\s*$", intro_txt)
+        race_condition = cond.group(1) if cond else None
+        return race_class, race_condition, post_time
+
+    def _parse_lap(self, soup: BeautifulSoup):
+        """Extracts the 200m lap splits and the first/last 3F pace from the lap table."""
+        for tb in soup.find_all("table", class_="result_table_02"):
+            txt = tb.get_text(" ", strip=True).replace(" ", " ")
+            if "ラップタイム" not in txt:
+                continue
+            laps = re.search(r"ラップ\s*([\d.\s\-]+?)\s*ペース", txt)
+            lap_times = re.sub(r"\s*-\s*", "-", laps.group(1).strip()) if laps else None
+            pace = re.search(r"\((\d+\.\d+\s*-\s*\d+\.\d+)\)", txt)
+            return lap_times, (re.sub(r"\s*", "", pace.group(1)) if pace else None)
+        return None, None
 
     def _parse_entries(self, soup: BeautifulSoup, race_id: str) -> List[Dict[str, Any]]:
         """
@@ -175,31 +257,46 @@ class NetkeibaScraper:
         if header_tr:
             for idx, th in enumerate(header_tr.find_all(["th", "td"])):
                 txt = th.get_text(strip=True)
+                # Paywalled columns (ﾀｲﾑ指数 / ｽﾀｰﾄ指数 / 上がり指数 ...) are always blank, and
+                # one of them contains the text "タイム指数(通常)" — which used to steal the
+                # "タイム" mapping from the real finish-time column further left.
+                if "指数" in txt:
+                    continue
                 if "着順" in txt or "着" == txt:
-                    col_map["finish_position"] = idx
+                    col_map.setdefault("finish_position", idx)
                 elif "枠" in txt:
-                    col_map["post_position"] = idx
+                    col_map.setdefault("post_position", idx)
                 elif "馬番" in txt:
-                    col_map["horse_number"] = idx
+                    col_map.setdefault("horse_number", idx)
                 elif "馬名" in txt:
-                    col_map["horse_name"] = idx
+                    col_map.setdefault("horse_name", idx)
                 elif "性齢" in txt:
-                    col_map["sex_age"] = idx
+                    col_map.setdefault("sex_age", idx)
                 elif "斤量" in txt:
-                    col_map["handicap_weight"] = idx
+                    col_map.setdefault("handicap_weight", idx)
                 elif "騎手" in txt:
-                    col_map["jockey_name"] = idx
+                    col_map.setdefault("jockey_name", idx)
                 elif "タイム" in txt:
-                    col_map["finish_time"] = idx
+                    col_map.setdefault("finish_time", idx)
                 elif "着差" in txt:
-                    col_map["margin"] = idx
+                    col_map.setdefault("margin", idx)
                 elif "単勝" in txt or "オッズ" in txt:
-                    col_map["odds"] = idx
+                    col_map.setdefault("odds", idx)
                 elif "人気" in txt:
-                    col_map["popularity"] = idx
+                    col_map.setdefault("popularity", idx)
                 elif "馬体重" in txt:
-                    col_map["horse_weight"] = idx
-                elif "調教師" in txt or "厩舎" in txt:
+                    col_map.setdefault("horse_weight", idx)
+                elif "上り" in txt:  # 上がり3ハロン. Distinct from the paywalled "上がり指数".
+                    col_map.setdefault("final_600m", idx)
+                elif "通過" in txt:
+                    col_map.setdefault("corner_positions", idx)
+                elif "賞金" in txt:
+                    col_map.setdefault("prize_money", idx)
+                elif "馬主" in txt:
+                    col_map.setdefault("owner_name", idx)
+                elif "調教師" in txt:
+                    col_map.setdefault("trainer_name", idx)
+                elif "厩舎" in txt and "ｺﾒﾝﾄ" not in txt and "コメント" not in txt:
                     col_map["trainer_name"] = idx
 
         rows = table.find_all("tr")[1:]  # Skip header
@@ -258,6 +355,11 @@ class NetkeibaScraper:
                 finish_time = get_val("finish_time") or None
                 margin = get_val("margin") or None
 
+                final_600m = _to_float(get_val("final_600m"))
+                corner_positions = get_val("corner_positions") or None
+                prize_money = _to_float(get_val("prize_money"))
+                owner_name = get_val("owner_name") or None
+
                 # Odds & Popularity
                 odds_text = get_val("odds", "1.0").replace(",", "")
                 try:
@@ -280,6 +382,10 @@ class NetkeibaScraper:
 
                 entries.append({
                     "race_id": race_id,
+                    "final_600m": final_600m,
+                    "corner_positions": corner_positions,
+                    "prize_money": prize_money,
+                    "owner_name": owner_name,
                     "horse_id": horse_id,
                     "horse_name": horse_name,
                     "post_position": post_position,
@@ -394,6 +500,116 @@ class NetkeibaScraper:
             return None
         return self.parse_race_result(html, race_id)
 
+    # ---- horse profile & pedigree -------------------------------------------------
+
+    def parse_horse(self, profile_html: str, pedigree_html: Optional[str], horse_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Builds a horse profile record. `pedigree_html` is optional — the profile page
+        renders its own pedigree table in JavaScript, so the sire/dam names have to come
+        from the separate /horse/ped/ page.
+        """
+        try:
+            soup = BeautifulSoup(profile_html, "html.parser")
+        except Exception:
+            return None
+
+        table = soup.find("table", class_=re.compile("db_prof_table"))
+        if table is None:
+            return None
+
+        prof: Dict[str, str] = {}
+        for tr in table.find_all("tr"):
+            th, td = tr.find("th"), tr.find("td")
+            if th and td:
+                prof[th.get_text(strip=True)] = td.get_text(" ", strip=True)
+
+        horse_name = None
+        for elem in (soup.find("h1"), soup.title):
+            if elem is None:
+                continue
+            candidate = re.split(r"[(（|]", elem.get_text(strip=True))[0].strip()
+            if candidate:
+                horse_name = candidate
+                break
+
+        trainer_raw = prof.get("調教師", "")
+        stable_match = re.search(r"[（(]\s*(栗東|美浦|地方|海外)\s*[)）]", trainer_raw)
+
+        record = {
+            "horse_id": horse_id,
+            "horse_name": horse_name or None,
+            "birth_date": self._parse_jp_date(prof.get("生年月日")),
+            "trainer_name": re.sub(r"[（(].*", "", trainer_raw).strip() or None,
+            "stable": stable_match.group(1) if stable_match else None,
+            "owner_name": prof.get("馬主") or None,
+            "breeder": prof.get("生産者") or None,
+            "origin": prof.get("産地") or None,
+            "auction_price": self._parse_price(prof.get("セリ取引価格")),
+            "sire": None, "sire_sire": None, "dam": None, "broodmare_sire": None,
+        }
+        if pedigree_html:
+            record.update(self.parse_pedigree(pedigree_html))
+        return record
+
+    def parse_pedigree(self, html: str) -> Dict[str, Any]:
+        """
+        Reads the 5-generation pedigree table. Generations are encoded as rowspans:
+        16 -> [sire, dam], 8 -> [sire's sire, sire's dam, dam's sire, dam's dam].
+        """
+        out = {"sire": None, "sire_sire": None, "dam": None, "broodmare_sire": None}
+        try:
+            table = BeautifulSoup(html, "html.parser").find("table", class_=re.compile("blood_table"))
+        except Exception:
+            return out
+        if table is None:
+            return out
+
+        def names(rowspan: int) -> List[str]:
+            cells = [td for td in table.find_all("td") if td.get("rowspan") == str(rowspan)]
+            result = []
+            for td in cells:
+                link = td.find("a")
+                result.append((link.get_text(strip=True) if link else td.get_text(" ", strip=True).split()[0]) or None)
+            return result
+
+        gen1, gen2 = names(16), names(8)
+        if len(gen1) >= 2:
+            out["sire"], out["dam"] = gen1[0], gen1[1]
+        if len(gen2) >= 3:
+            out["sire_sire"], out["broodmare_sire"] = gen2[0], gen2[2]
+        return out
+
+    @staticmethod
+    def _parse_jp_date(text: Optional[str]) -> Optional[str]:
+        """'2023年2月28日' -> '2023-02-28'"""
+        m = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", text or "")
+        return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}" if m else None
+
+    @staticmethod
+    def _parse_price(text: Optional[str]) -> Optional[float]:
+        """'4,200万円' -> 4200.0. '-' (not sold at auction) -> None."""
+        m = re.search(r"([\d,]+)\s*万円", text or "")
+        return float(m.group(1).replace(",", "")) if m else None
+
+    def scrape_horse_and_save(self, horse_id: str, db: Session, with_pedigree: bool = True,
+                              use_cache: bool = True) -> Optional[Horse]:
+        """Scrapes one horse profile and upserts it into the horses table."""
+        profile_html = self.fetch_horse_html(horse_id, use_cache=use_cache)
+        if not profile_html:
+            return None
+        pedigree_html = self.fetch_pedigree_html(horse_id, use_cache=use_cache) if with_pedigree else None
+
+        data = self.parse_horse(profile_html, pedigree_html, horse_id)
+        if not data:
+            return None
+
+        horse = db.query(Horse).filter_by(horse_id=horse_id).first() or Horse(horse_id=horse_id)
+        for key, value in data.items():
+            setattr(horse, key, value)
+        horse.scraped_at = datetime.now(timezone.utc)
+        db.add(horse)
+        return horse
+
     def scrape_race_and_save(
         self, race_id: str, db: Session, use_cache: bool = True
     ) -> Optional[Race]:
@@ -414,7 +630,13 @@ class NetkeibaScraper:
             surface=data["surface"],
             track_condition=data["track_condition"],
             weather=data["weather"],
+            race_class=data.get("race_class"),
+            race_condition=data.get("race_condition"),
+            post_time=data.get("post_time"),
+            lap_times=data.get("lap_times"),
+            pace=data.get("pace"),
             status=data["status"],
+            parser_version=PARSER_VERSION,
         )
 
         for e in data.get("entries", []):
@@ -436,6 +658,10 @@ class NetkeibaScraper:
                 finish_position=e.get("finish_position"),
                 finish_time=e.get("finish_time"),
                 margin=e.get("margin"),
+                final_600m=e.get("final_600m"),
+                corner_positions=e.get("corner_positions"),
+                prize_money=e.get("prize_money"),
+                owner_name=e.get("owner_name"),
             )
             race.entries.append(entry)
 
@@ -447,6 +673,11 @@ class NetkeibaScraper:
                 payout=p["payout"],
             )
             race.payouts.append(payout)
+
+        existing = db.query(Race).filter_by(id=data["id"]).first()
+        if existing is not None:
+            db.delete(existing)   # cascades to entries and payouts
+            db.flush()
 
         db.add(race)
         db.commit()
